@@ -45,7 +45,15 @@ from_source() {
   install Rust from https://rustup.rs and re-run, or build it yourself:
   git clone https://github.com/$REPO && cd lulz-router && cargo install --path ."
     say "==> no prebuilt binary for $TARGET; building from source"
-    cargo install --git "https://github.com/$REPO" --root "${INSTALL_DIR%/bin}" --force
+    # cargo appends /bin to --root, so build into a scratch root and place the
+    # binary ourselves; INSTALL_DIR is a literal directory, not a prefix.
+    root=$(mktemp -d)
+    cargo install --git "https://github.com/$REPO" --root "$root" --force
+    mkdir -p "$INSTALL_DIR"
+    install -m 755 "$root/bin/$BIN" "$INSTALL_DIR/$BIN" 2>/dev/null \
+        || { cp "$root/bin/$BIN" "$INSTALL_DIR/$BIN" && chmod 755 "$INSTALL_DIR/$BIN"; }
+    rm -rf "$root"
+    say "==> installed $INSTALL_DIR/$BIN"
     exit 0
 }
 
