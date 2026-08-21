@@ -16,7 +16,25 @@ servers, permissions, sandbox. Only the inference provider changes.
 ## Install
 
 ```sh
-cargo install --path .
+curl -fsSL https://raw.githubusercontent.com/Lulzx/lulz-router/main/install.sh | sh
+```
+
+Prebuilt for Apple Silicon; every other platform builds from source (needs
+[Rust](https://rustup.rs)). Installs to `~/.local/bin` — override with
+`LULZ_INSTALL_DIR`, pin a version with `LULZ_VERSION`.
+
+Piping a script into a shell means running whatever that URL serves. Read it
+first if you'd rather:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Lulzx/lulz-router/main/install.sh -o install.sh
+less install.sh && sh install.sh
+```
+
+Or from source directly:
+
+```sh
+cargo install --git https://github.com/Lulzx/lulz-router
 ```
 
 One dependency (`serde_json`) — the bridge rewrites arbitrary user text between
