@@ -1,0 +1,16 @@
+[package]
+name = "lulz"
+version = "0.1.0"
+edition = "2021"
+description = "Run any coding-agent harness on your OpenCode Go subscription"
+repository = "https://github.com/Lulzx/lulz-router"
+license = "MIT"
+
+[dependencies]
+serde_json = { version = "1", default-features = false, features = ["std"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
