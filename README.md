@@ -44,8 +44,8 @@ std plus `curl` and `security`.
 ## Use
 
 ```sh
-lulz launch claude                  # Claude Code on glm-5.3-flash
-lulz launch claude -m minimax-m3
+lulz launch claude                  # Claude Code on minimax-m3
+lulz launch claude -m deepseek-v4-pro
 lulz launch codex -m gpt-5.6-luna
 lulz launch opencode -m glm-5.3
 
@@ -72,7 +72,7 @@ you had typed `claude` or `codex`.
 ```sh
 ANTHROPIC_BASE_URL=https://opencode.ai/zen/go
 ANTHROPIC_API_KEY=<your go key>
-ANTHROPIC_MODEL=glm-5.3-flash
+ANTHROPIC_MODEL=minimax-m3
 ANTHROPIC_SMALL_FAST_MODEL=deepseek-v4-flash   # background/haiku traffic
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000         # else it assumes 200k
 ```
@@ -100,9 +100,11 @@ result:
 | model | claude | codex | note |
 |---|:--:|:--:|---|
 | qwen3.5/3.6/3.7/3.8, minimax-m2.5/m2.7/m3, kimi-k3 | native | bridged | Messages+tools ok; no `/responses` |
-| deepseek-v4-flash/pro, gpt-5.6-luna, muse-spark-1.2 | native | native | both |
+| deepseek-v4-flash/pro, muse-spark-1.2 | native | native | both |
+| gpt-5.6-luna | ❌ | native | Messages 500s for this model |
 | grok-4.5 | ❌ | native | Messages 401s for this model |
-| glm-5…5.3, hy3, kimi-k2.x, mimo-\*, ox-alpha | ❌ | bridged | Messages rejects tool schemas |
+| glm-5…5.3 + glm-5.3-flash | ❌ | bridged | Messages rejects tool schemas / 500s |
+| hy3, kimi-k2.x, mimo-\*, ox-alpha | ❌ | bridged | Messages rejects tool schemas |
 
 The *roster* is never hardcoded: `lulz` reads the gateway's own
 `/v1/models` and caches the ids at `~/.cache/lulz/models` for 12 hours, so a
@@ -125,10 +127,19 @@ result at `~/.cache/lulz/caps`, overlaying the baseline — so the table doesn't
 rot as OpenCode adds models.
 
 Only a verdict about the **model** is cached. A 200 is `ok` and a 400/404/422
-is `no` (the model rejected the request shape), but 401, 403, 429, 5xx and a
-dead connection are printed with their status code and left uncached — an
-outage, a throttle or a bad key says nothing about what a model can do, and
-recording it as `no` would gate a working model until the next probe.
+is `no` (the model rejected the request shape), but 401, 403, 429 and a dead
+connection are printed with their status code and left uncached — an outage, a
+throttle or a bad key says nothing about what a model can do, and recording it
+as `no` would gate a working model until the next probe.
+
+A 5xx gets one more chance, and then has to answer for itself. If the retry
+returns the *same* 5xx **and** that endpoint served some other model during the
+same run, the gateway was demonstrably up and the route is the thing that is
+broken, so it caches as `no` (reported under `gated`). If nothing got through
+all run, it stays uncached. Without that second question a permanently broken
+route is indistinguishable from a bad moment, and a model the gateway will
+never serve can sit in the baseline as `yes` forever — which is precisely how
+`glm-5.3-flash` stayed the default while 500ing on every single request.
 
 ## The bridge
 

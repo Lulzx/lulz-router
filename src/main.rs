@@ -22,7 +22,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GO_ROOT: &str = "https://opencode.ai/zen/go";
 const GO_V1: &str = "https://opencode.ai/zen/go/v1";
 
-const DEFAULT_CLAUDE_MODEL: &str = "glm-5.3-flash";
+const DEFAULT_CLAUDE_MODEL: &str = "minimax-m3";
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-luna";
 const DEFAULT_SMALL_MODEL: &str = "deepseek-v4-flash";
 
@@ -51,12 +51,13 @@ const MODELS: &[Caps] = &[
     m("glm-5.1", 202752, false, false),
     m("glm-5.2", 1000000, false, false),
     m("glm-5.3", 1000000, false, false),
-    // `claude` unverified: the gateway has been 500ing this one on every
-    // endpoint, so no probe has proved it either way. Left permissive so the
-    // default model isn't gated on an outage — `lulz doctor` settles it once
-    // the gateway answers. Context per models.dev, which /v1/models omits.
-    m("glm-5.3-flash", 1000000, true, false),
-    m("gpt-5.6-luna", 1050000, true, true),
+    // The whole glm family 500s on /v1/messages — repeatedly, with and without
+    // tools, while other models answer on the same endpoint in the same run.
+    // Chat Completions serves it fine, so this is the gateway's Anthropic
+    // shape, not the model. Context per models.dev, which /v1/models omits.
+    m("glm-5.3-flash", 1000000, false, false),
+    // Anthropic shape 500s the same way; /responses works, so codex-only.
+    m("gpt-5.6-luna", 1050000, false, true),
     m("grok-4.5", 500000, false, true),
     m("hy3", 256000, false, false),
     m("hy3-preview", 256000, false, false),
@@ -618,6 +619,10 @@ const TOOL_PROBE: &str = concat!(
 enum Verdict {
     Ok,
     No,
+    /// Every attempt came back with the same 5xx. That is either an outage or
+    /// a route the gateway cannot serve for this model; only the rest of the
+    /// run can tell which, so `settle` decides once the run is over.
+    Down(u32),
     Unknown(u32),
 }
 
@@ -634,10 +639,39 @@ fn verdict(status: u32) -> Verdict {
     }
 }
 
+fn is_5xx(c: u32) -> bool {
+    (500..600).contains(&c)
+}
+
+/// Probe once; on a 5xx, probe again. A single upstream error is noise, but
+/// the *same* 5xx twice is a property of the route rather than a bad moment —
+/// which is what lets a consistently broken model be gated at all.
+fn probe(url: &str, headers: &[&str], body: &str) -> Verdict {
+    match verdict(post_status(url, headers, body)) {
+        Verdict::Unknown(c) if is_5xx(c) => match verdict(post_status(url, headers, body)) {
+            Verdict::Unknown(c2) if c2 == c => Verdict::Down(c),
+            second => second,
+        },
+        first => first,
+    }
+}
+
+/// A repeated 5xx only says something about the *model* if the endpoint served
+/// somebody else in the same run. If nothing got through, the gateway was down
+/// and the run proves nothing — stay quiet and let the baseline stand.
+fn settle(v: Verdict, endpoint_answered: bool) -> Verdict {
+    match v {
+        Verdict::Down(_) if endpoint_answered => Verdict::No,
+        Verdict::Down(c) => Verdict::Unknown(c),
+        other => other,
+    }
+}
+
 fn show(v: &Verdict) -> String {
     match v {
         Verdict::Ok => paint("yes", "32"),
         Verdict::No => paint(" - ", "2"),
+        Verdict::Down(c) => paint(&format!("{c}x2"), "31"),
         Verdict::Unknown(c) => paint(&format!("{c}?"), "33"),
     }
 }
@@ -647,7 +681,8 @@ fn record(out: &mut String, harness: &str, id: &str, v: &Verdict) {
         Verdict::Ok => out.push_str(&format!("{harness}:{id}=ok\n")),
         Verdict::No => out.push_str(&format!("{harness}:{id}=no\n")),
         // Deliberately unwritten — `can_run` then falls back to the baseline.
-        Verdict::Unknown(_) => {}
+        // `Down` never reaches here: `settle` turns it into `No` or `Unknown`.
+        Verdict::Down(_) | Verdict::Unknown(_) => {}
     }
 }
 
@@ -662,37 +697,63 @@ fn cmd_doctor() -> Result<(), String> {
     }
 
     println!("\n{} {}\n", paint("probing", "1"), paint(GO_V1, "2"));
-    let mut out = String::new();
-    let mut unknown = 0usize;
-    let mut auth_failures = 0usize;
+    // Whether each endpoint served *anybody* this run. Until that is known a
+    // repeated 5xx cannot be read, so verdicts are settled after the loop.
+    let mut claude_answered = false;
+    let mut codex_answered = false;
+    let mut results: Vec<(String, Verdict, Verdict)> = Vec::with_capacity(ids.len());
     for id in &ids {
-        let claude = verdict(post_status(
+        let claude = probe(
             &format!("{GO_V1}/messages"),
             &["-H", &format!("x-api-key: {key}"), "-H", "anthropic-version: 2023-06-01"],
             &TOOL_PROBE.replace("%M", id),
-        ));
-        let codex = verdict(post_status(
+        );
+        let codex = probe(
             &format!("{GO_V1}/responses"),
             &["-H", &format!("Authorization: Bearer {key}")],
             &format!(r#"{{"model":"{id}","input":"hi","max_output_tokens":16}}"#),
-        ));
-        for v in [&claude, &codex] {
+        );
+        claude_answered |= matches!(claude, Verdict::Ok);
+        codex_answered |= matches!(codex, Verdict::Ok);
+        println!("  {id:<28} claude {:<12} codex {}", show(&claude), show(&codex));
+        results.push((id.clone(), claude, codex));
+    }
+
+    let mut out = String::new();
+    let mut unknown = 0usize;
+    let mut auth_failures = 0usize;
+    let mut gated: Vec<String> = Vec::new();
+    for (id, claude, codex) in results {
+        for (harness, v, answered) in
+            [("claude", claude, claude_answered), ("codex", codex, codex_answered)]
+        {
+            let was_down = matches!(v, Verdict::Down(_));
+            let v = settle(v, answered);
+            if was_down && matches!(v, Verdict::No) {
+                gated.push(format!("{harness}:{id}"));
+            }
             if let Verdict::Unknown(c) = v {
                 unknown += 1;
                 if matches!(c, 401 | 403) {
                     auth_failures += 1;
                 }
             }
+            record(&mut out, harness, &id, &v);
         }
-        println!("  {id:<28} claude {:<12} codex {}", show(&claude), show(&codex));
-        record(&mut out, "claude", id, &claude);
-        record(&mut out, "codex", id, &codex);
     }
 
     let p = cache_path();
     fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
     fs::write(&p, out).map_err(|e| e.to_string())?;
     println!("\n  cached to {}", p.display());
+    if !gated.is_empty() {
+        println!(
+            "  {} {} route(s) failed twice while the endpoint was serving others,\n  so they are now cached as unsupported: {}",
+            paint("gated", "31"),
+            gated.len(),
+            gated.join(", "),
+        );
+    }
     if unknown > 0 {
         println!(
             "  {} {unknown} probe(s) were inconclusive — shown with their status code\n  and left uncached, so the baseline still applies. Re-run `lulz doctor` later.",
@@ -956,6 +1017,40 @@ mod tests {
         assert!(can_run("codex", "gpt-5.6-luna"));
         assert!(!can_run("codex", "kimi-k3"));    // no /responses
         assert!(can_run("claude", "some-new-model")); // unknown: let it try
+        // Both 500 on /v1/messages however often you ask; luna still has
+        // /responses, so it stays a codex model rather than no model at all.
+        assert!(!can_run("claude", "glm-5.3-flash"));
+        assert!(!can_run("claude", "gpt-5.6-luna"));
+    }
+
+    /// The bug this table shipped with: the default model was marked
+    /// claude-capable on a guess, and every `lulz launch claude` walked into a
+    /// route the gateway will not serve. A default must be a verified one.
+    #[test]
+    fn the_defaults_can_drive_the_harness_they_default_for() {
+        assert!(caps(DEFAULT_CLAUDE_MODEL).is_some_and(|c| c.claude));
+        assert!(caps(DEFAULT_CODEX_MODEL).is_some_and(|c| c.codex));
+        // Claude Code drives the small model over Messages too.
+        assert!(caps(DEFAULT_SMALL_MODEL).is_some_and(|c| c.claude));
+    }
+
+    #[test]
+    fn a_repeated_5xx_gates_only_when_the_endpoint_was_alive() {
+        // Others got served, so the gateway was up and this route is the fault.
+        assert!(matches!(settle(Verdict::Down(500), true), Verdict::No));
+        // Nothing got through all run: an outage proves nothing about a model.
+        assert!(matches!(settle(Verdict::Down(500), false), Verdict::Unknown(500)));
+        // Everything else settles to itself.
+        assert!(matches!(settle(Verdict::Ok, false), Verdict::Ok));
+        assert!(matches!(settle(Verdict::Unknown(429), true), Verdict::Unknown(429)));
+    }
+
+    #[test]
+    fn a_settled_outage_is_never_cached() {
+        let mut out = String::new();
+        record(&mut out, "claude", "up", &settle(Verdict::Down(500), true));
+        record(&mut out, "claude", "down", &settle(Verdict::Down(503), false));
+        assert_eq!(out, "claude:up=no\n");
     }
 
     fn ids(v: &[&str]) -> Vec<String> {
