@@ -44,7 +44,7 @@ std plus `curl` and `security`.
 ## Use
 
 ```sh
-lulz launch claude                  # Claude Code on qwen3.8-max
+lulz launch claude                  # Claude Code on glm-5.3-flash
 lulz launch claude -m minimax-m3
 lulz launch codex -m gpt-5.6-luna
 lulz launch opencode -m glm-5.3
@@ -53,6 +53,7 @@ lulz launch claude -- --resume      # everything after -- goes to the harness
 lulz launch claude --print          # show the resolved env + argv, run nothing
 
 lulz models                         # what your subscription exposes
+lulz models --refresh               # re-read the gateway's model list
 lulz default claude qwen3.8-max     # persist a per-harness default
 lulz auth --save                    # stash the key in the macOS Keychain
 ```
@@ -71,7 +72,7 @@ you had typed `claude` or `codex`.
 ```sh
 ANTHROPIC_BASE_URL=https://opencode.ai/zen/go
 ANTHROPIC_API_KEY=<your go key>
-ANTHROPIC_MODEL=qwen3.8-max
+ANTHROPIC_MODEL=glm-5.3-flash
 ANTHROPIC_SMALL_FAST_MODEL=deepseek-v4-flash   # background/haiku traffic
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000         # else it assumes 200k
 ```
@@ -103,8 +104,31 @@ result:
 | grok-4.5 | ❌ | native | Messages 401s for this model |
 | glm-5…5.3, hy3, kimi-k2.x, mimo-\*, ox-alpha | ❌ | bridged | Messages rejects tool schemas |
 
-`lulz doctor` re-probes the live gateway and caches the result over that
-baseline, so the table doesn't rot as OpenCode adds models.
+The *roster* is never hardcoded: `lulz` reads the gateway's own
+`/v1/models` and caches the ids at `~/.cache/lulz/models` for 12 hours, so a
+model OpenCode shipped this morning shows up without a `lulz` release. The
+table above only supplies what that endpoint doesn't report — protocol support
+and context window. `--refresh` re-reads it on demand; if the fetch fails,
+`lulz` falls back to the stale cache and, failing that, stops gating.
+
+Naming a model the gateway doesn't serve is caught before the harness starts:
+
+```
+$ lulz launch claude -m glm-9-turbo
+error `glm-9-turbo` isn't served by this gateway.
+  close by: glm-5, glm-5.1, glm-5.2, glm-5.3, glm-5.3-flash
+  full list: lulz models
+```
+
+`lulz doctor` re-probes each id on the live roster and caches the *capability*
+result at `~/.cache/lulz/caps`, overlaying the baseline — so the table doesn't
+rot as OpenCode adds models.
+
+Only a verdict about the **model** is cached. A 200 is `ok` and a 400/404/422
+is `no` (the model rejected the request shape), but 401, 403, 429, 5xx and a
+dead connection are printed with their status code and left uncached — an
+outage, a throttle or a bad key says nothing about what a model can do, and
+recording it as `no` would gate a working model until the next probe.
 
 ## The bridge
 

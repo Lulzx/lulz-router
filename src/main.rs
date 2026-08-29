@@ -13,6 +13,7 @@ use std::io::IsTerminal;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -21,12 +22,14 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GO_ROOT: &str = "https://opencode.ai/zen/go";
 const GO_V1: &str = "https://opencode.ai/zen/go/v1";
 
-const DEFAULT_CLAUDE_MODEL: &str = "qwen3.8-max";
+const DEFAULT_CLAUDE_MODEL: &str = "glm-5.3-flash";
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-luna";
 const DEFAULT_SMALL_MODEL: &str = "deepseek-v4-flash";
 
 /// What each model can actually drive, probed against the live gateway
-/// (`lulz doctor` re-probes and caches the result over this baseline):
+/// (`lulz doctor` re-probes and caches the result over this baseline).
+/// The *roster* is the gateway's own `/v1/models` — this table only carries
+/// what that endpoint won't tell us:
 ///   claude — Anthropic Messages *with tools*, the only shape a harness uses
 ///   codex  — OpenAI Responses
 ///   ctx    — real context window, else Claude Code assumes 200k
@@ -48,6 +51,11 @@ const MODELS: &[Caps] = &[
     m("glm-5.1", 202752, false, false),
     m("glm-5.2", 1000000, false, false),
     m("glm-5.3", 1000000, false, false),
+    // `claude` unverified: the gateway has been 500ing this one on every
+    // endpoint, so no probe has proved it either way. Left permissive so the
+    // default model isn't gated on an outage — `lulz doctor` settles it once
+    // the gateway answers. Context per models.dev, which /v1/models omits.
+    m("glm-5.3-flash", 1000000, true, false),
     m("gpt-5.6-luna", 1050000, true, true),
     m("grok-4.5", 500000, false, true),
     m("hy3", 256000, false, false),
@@ -92,7 +100,7 @@ fn main() {
 
     let r = match head {
         "launch" | "run" => cmd_launch(&args[1..]),
-        "models" | "model" | "ls" => cmd_models(),
+        "models" | "model" | "ls" => cmd_models(&args[1..]),
         "auth" | "key" => cmd_auth(&args[1..]),
         "doctor" | "probe" => cmd_doctor(),
         "default" | "defaults" => cmd_default(&args[1..]),
@@ -121,7 +129,7 @@ run any coding-agent harness on your OpenCode Go subscription
 
 {usage}
   lulz launch <harness> [-m <model>] [-- <harness args>...]
-  lulz models
+  lulz models [--refresh]
   lulz auth [--save]
   lulz doctor
   lulz default <harness> <model>
@@ -137,7 +145,7 @@ run any coding-agent harness on your OpenCode Go subscription
   lulz launch codex -m gpt-5.6-luna
   lulz launch codex -m qwen3.8-max     # bridged automatically
   lulz launch claude -- --resume
-  lulz default claude qwen3.8-max
+  lulz default claude qwen3.8-max     # override the default
 
 {flags}
   -m, --model <id>    model to run (alias ok: qwen, glm, kimi, gpt, grok, ...)
@@ -146,6 +154,7 @@ run any coding-agent harness on your OpenCode Go subscription
       --no-translate  refuse instead of bridging (codex talks to the gateway
                       directly, which only works for a few models)
       --print         print the resolved command and env, then exit
+  -r, --refresh       (models) re-read /v1/models instead of the 12h cache
 ",
         name = paint("lulz", "35;1"),
         usage = paint("usage", "1"),
@@ -211,13 +220,16 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
     let key = find_key()?.value;
     let cfg = read_config();
 
-    let pick = |dflt: &str| -> String {
+    // What the gateway actually serves, so a model it has never heard of is a
+    // sentence from lulz rather than an opaque API error from the harness.
+    let served = roster(&key, false);
+    let pick = |dflt: &str| -> Result<String, String> {
         let raw = opts
             .model
             .clone()
             .or_else(|| cfg.get(&harness).cloned())
             .unwrap_or_else(|| dflt.to_string());
-        resolve_alias(&raw)
+        ensure_served(resolve_alias(&raw), &served)
     };
 
     let gate = |model: &str| -> Result<(), String> {
@@ -226,7 +238,7 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
         }
         let alt = if harness == "codex" { "claude" } else { "codex" };
         let ok = best_for(&harness);
-        let shown = ok.iter().take(5).copied().collect::<Vec<_>>().join(", ");
+        let shown = ok.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
         let more = if ok.len() > 5 {
             format!(" (+{} more, see `lulz models`)", ok.len() - 5)
         } else {
@@ -247,13 +259,15 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
     let (bin, model, argv, env): (&str, String, Vec<String>, Vec<(String, String)>) =
         match harness.as_str() {
             "claude" => {
-                let model = pick(DEFAULT_CLAUDE_MODEL);
+                let model = pick(DEFAULT_CLAUDE_MODEL)?;
                 gate(&model)?;
-                let small = opts
-                    .small
-                    .clone()
-                    .map(|s| resolve_alias(&s))
-                    .unwrap_or_else(|| DEFAULT_SMALL_MODEL.to_string());
+                let small = ensure_served(
+                    opts.small
+                        .clone()
+                        .map(|s| resolve_alias(&s))
+                        .unwrap_or_else(|| DEFAULT_SMALL_MODEL.to_string()),
+                    &served,
+                )?;
                 // The gateway's Messages endpoint authenticates on `x-api-key`
                 // only; ANTHROPIC_AUTH_TOKEN would send `Authorization: Bearer`
                 // and come back 401.
@@ -273,7 +287,7 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
                 ("claude", model, opts.rest.clone(), env)
             }
             "codex" => {
-                let model = pick(DEFAULT_CODEX_MODEL);
+                let model = pick(DEFAULT_CODEX_MODEL)?;
                 // The gateway serves /responses for a handful of models and
                 // Chat Completions for all of them, so bridge by default
                 // rather than refusing a model that plainly works.
@@ -307,7 +321,7 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
                 ("codex", model, argv, env)
             }
             "opencode" => {
-                let model = pick(DEFAULT_CLAUDE_MODEL);
+                let model = pick(DEFAULT_CLAUDE_MODEL)?;
                 let mut argv = vec!["--model".into(), format!("opencode-go/{model}")];
                 argv.extend(opts.rest.clone());
                 let env = vec![("OPENCODE_API_KEY".into(), key.clone())];
@@ -324,7 +338,7 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
 
     if opts.print {
         for (k, v) in &env {
-            println!("{k}={}", if k.contains("TOKEN") || k.contains("KEY") { mask(v) } else { v.clone() });
+            println!("{k}={}", if is_secret(k) { mask(v) } else { v.clone() });
         }
         println!("{} {}", path.display(), argv.join(" "));
         return Ok(());
@@ -374,12 +388,12 @@ fn banner(harness: &str, model: &str, translate: bool) {
 
 // ---------------------------------------------------------------- models ---
 
-fn cmd_models() -> Result<(), String> {
+fn cmd_models(args: &[String]) -> Result<(), String> {
+    let force = args.iter().any(|a| a == "--refresh" || a == "-r");
     let key = find_key()?.value;
-    let body = curl(&format!("{GO_V1}/models"), &key)?;
-    let ids = json_ids(&body);
+    let ids = roster(&key, force);
     if ids.is_empty() {
-        return Err(format!("could not read the model list:\n{}", body.trim()));
+        return Err(format!("could not read the model list from {GO_V1}/models"));
     }
 
     println!("\n{}\n", paint("OpenCode Go models", "1"));
@@ -410,12 +424,24 @@ fn cmd_models() -> Result<(), String> {
         );
     }
     println!(
-        "\n  {} lulz launch claude -m {}\n  {} lulz doctor\n",
+        "\n  {} lulz launch claude -m {}\n  {} lulz doctor\n  {} {}\n",
         paint("run:  ", "2"),
         DEFAULT_CLAUDE_MODEL,
         paint("check:", "2"),
+        paint("list: ", "2"),
+        roster_age_note(),
     );
     Ok(())
+}
+
+/// Where the printed roster came from, so a surprising list is explicable.
+fn roster_age_note() -> String {
+    match read_roster().map(|(_, age)| age.as_secs() / 60) {
+        Some(0) => "fetched just now".into(),
+        Some(m) if m < 60 => format!("cached {m}m ago — lulz models --refresh"),
+        Some(m) => format!("cached {}h ago — lulz models --refresh", m / 60),
+        None => "baseline table (gateway unreachable)".into(),
+    }
 }
 
 fn caps(model: &str) -> Option<&'static Caps> {
@@ -439,12 +465,12 @@ fn context_window(model: &str) -> Option<u32> {
     caps(model).map(|c| c.ctx)
 }
 
-fn best_for(harness: &str) -> Vec<&'static str> {
-    MODELS
-        .iter()
-        .filter(|c| can_run(harness, c.id))
-        .map(|c| c.id)
-        .collect()
+fn best_for(harness: &str) -> Vec<String> {
+    best_among(harness, &known_models())
+}
+
+fn best_among(harness: &str, ids: &[String]) -> Vec<String> {
+    ids.iter().filter(|id| can_run(harness, id)).cloned().collect()
 }
 
 fn mark(ok: bool) -> String {
@@ -461,6 +487,103 @@ fn resolve_alias(raw: &str) -> String {
         .find(|(a, _)| *a == raw)
         .map(|(_, m)| m.to_string())
         .unwrap_or_else(|| raw.to_string())
+}
+
+// ---------------------------------------------------------------- roster ---
+
+/// How long a fetched model list stays fresh before `lulz` re-reads
+/// `/v1/models`. The roster changes when OpenCode adds a model, not by the
+/// minute, so half a day keeps launches instant without going stale.
+const ROSTER_TTL: Duration = Duration::from_secs(12 * 3600);
+
+fn roster_path() -> PathBuf {
+    home().join(".cache/lulz/models")
+}
+
+/// Cached ids plus the age of the cache; `None` if it was never written.
+fn read_roster() -> Option<(Vec<String>, Duration)> {
+    let ids = parse_roster(&fs::read_to_string(roster_path()).ok()?);
+    if ids.is_empty() {
+        return None;
+    }
+    let age = fs::metadata(roster_path())
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .unwrap_or(ROSTER_TTL);
+    Some((ids, age))
+}
+
+fn parse_roster(body: &str) -> Vec<String> {
+    body.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
+        .collect()
+}
+
+fn write_roster(ids: &[String]) {
+    let p = roster_path();
+    if fs::create_dir_all(p.parent().unwrap()).is_ok() {
+        let _ = fs::write(&p, ids.join("\n") + "\n");
+    }
+}
+
+/// The ids the gateway serves right now, cached at `~/.cache/lulz/models`.
+///
+/// A fetch failure falls back to the stale cache and then to the baseline
+/// table, so a flaky network degrades the roster rather than blocking a
+/// launch. `force` skips the cache — what `lulz models --refresh` and
+/// `lulz doctor` want.
+fn roster(key: &str, force: bool) -> Vec<String> {
+    if !force {
+        if let Some((ids, age)) = read_roster() {
+            if age < ROSTER_TTL {
+                return ids;
+            }
+        }
+    }
+    if let Ok(body) = curl(&format!("{GO_V1}/models"), key) {
+        let ids = json_ids(&body);
+        if !ids.is_empty() {
+            write_roster(&ids);
+            return ids;
+        }
+    }
+    // Stale beats nothing; nothing beats a wrong answer. An empty roster is
+    // "I don't know", and every caller treats that as "let it through".
+    read_roster().map(|(ids, _)| ids).unwrap_or_default()
+}
+
+/// Best offline guess at the roster: the cache if there is one, else the
+/// baseline table. Used where a network round-trip would be rude — printing
+/// a suggestion after something already went wrong.
+fn known_models() -> Vec<String> {
+    read_roster()
+        .map(|(ids, _)| ids)
+        .unwrap_or_else(|| MODELS.iter().map(|c| c.id.to_string()).collect())
+}
+
+/// Reject a model the gateway doesn't serve *before* the harness starts and
+/// reports it as a bare API error.
+fn ensure_served(model: String, roster: &[String]) -> Result<String, String> {
+    if roster.is_empty() || roster.iter().any(|id| *id == model) {
+        return Ok(model);
+    }
+    // Everything up to the first digit — `glm-5.4-flash` suggests the glm family.
+    let stem: String = model.chars().take_while(|c| !c.is_ascii_digit()).collect();
+    let near: Vec<&str> = roster
+        .iter()
+        .filter(|id| stem.len() > 1 && id.starts_with(&stem))
+        .map(String::as_str)
+        .take(6)
+        .collect();
+    let mut msg = format!("`{model}` isn't served by this gateway.");
+    if !near.is_empty() {
+        msg.push_str(&format!("\n  close by: {}", near.join(", ")));
+    }
+    msg.push_str("\n  full list: lulz models");
+    Err(msg)
 }
 
 // ---------------------------------------------------------------- doctor ---
@@ -489,41 +612,100 @@ const TOOL_PROBE: &str = concat!(
     r#""messages":[{"role":"user","content":[{"type":"text","text":"list /tmp using the tool"}]}]}"#
 );
 
+/// What one probe proved. A capability cache may only record facts about the
+/// *model*; an outage, a throttle or a bad key says nothing about it, and
+/// writing "no" for those would gate a working model until the next probe.
+enum Verdict {
+    Ok,
+    No,
+    Unknown(u32),
+}
+
+/// Read the gateway's answer as a claim about the model, or refuse to.
+///   200            — it works
+///   400/404/422    — the model rejects this request shape: a real capability
+///   401/403/429    — key, routing or throttle. Not about the model.
+///   5xx, 0         — upstream is down or curl never got an answer.
+fn verdict(status: u32) -> Verdict {
+    match status {
+        200 => Verdict::Ok,
+        400 | 404 | 405 | 422 => Verdict::No,
+        other => Verdict::Unknown(other),
+    }
+}
+
+fn show(v: &Verdict) -> String {
+    match v {
+        Verdict::Ok => paint("yes", "32"),
+        Verdict::No => paint(" - ", "2"),
+        Verdict::Unknown(c) => paint(&format!("{c}?"), "33"),
+    }
+}
+
+fn record(out: &mut String, harness: &str, id: &str, v: &Verdict) {
+    match v {
+        Verdict::Ok => out.push_str(&format!("{harness}:{id}=ok\n")),
+        Verdict::No => out.push_str(&format!("{harness}:{id}=no\n")),
+        // Deliberately unwritten — `can_run` then falls back to the baseline.
+        Verdict::Unknown(_) => {}
+    }
+}
+
 /// Ask the gateway what it will actually accept, rather than trusting the
 /// baseline table. Tools are the point: a model that 400s on a tool schema is
 /// useless to a coding harness even though plain chat works.
 fn cmd_doctor() -> Result<(), String> {
     let key = find_key()?.value;
-    let ids = json_ids(&curl(&format!("{GO_V1}/models"), &key)?);
+    let ids = roster(&key, true);
     if ids.is_empty() {
         return Err("could not read the model list".into());
     }
 
     println!("\n{} {}\n", paint("probing", "1"), paint(GO_V1, "2"));
     let mut out = String::new();
+    let mut unknown = 0usize;
+    let mut auth_failures = 0usize;
     for id in &ids {
-        let claude = post_status(
+        let claude = verdict(post_status(
             &format!("{GO_V1}/messages"),
             &["-H", &format!("x-api-key: {key}"), "-H", "anthropic-version: 2023-06-01"],
             &TOOL_PROBE.replace("%M", id),
-        ) == 200;
-        let codex = post_status(
+        ));
+        let codex = verdict(post_status(
             &format!("{GO_V1}/responses"),
             &["-H", &format!("Authorization: Bearer {key}")],
             &format!(r#"{{"model":"{id}","input":"hi","max_output_tokens":16}}"#),
-        ) == 200;
-        println!("  {id:<28} claude {:<8} codex {}", mark(claude), mark(codex));
-        out.push_str(&format!(
-            "claude:{id}={}\ncodex:{id}={}\n",
-            if claude { "ok" } else { "no" },
-            if codex { "ok" } else { "no" }
         ));
+        for v in [&claude, &codex] {
+            if let Verdict::Unknown(c) = v {
+                unknown += 1;
+                if matches!(c, 401 | 403) {
+                    auth_failures += 1;
+                }
+            }
+        }
+        println!("  {id:<28} claude {:<12} codex {}", show(&claude), show(&codex));
+        record(&mut out, "claude", id, &claude);
+        record(&mut out, "codex", id, &codex);
     }
 
     let p = cache_path();
     fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
     fs::write(&p, out).map_err(|e| e.to_string())?;
-    println!("\n  cached to {}\n", p.display());
+    println!("\n  cached to {}", p.display());
+    if unknown > 0 {
+        println!(
+            "  {} {unknown} probe(s) were inconclusive — shown with their status code\n  and left uncached, so the baseline still applies. Re-run `lulz doctor` later.",
+            paint("note", "33"),
+        );
+    }
+    if auth_failures > 0 {
+        println!(
+            "  {} the gateway rejected the key on {auth_failures} probe(s). If that persists,\n  re-run `opencode auth login`, then `lulz auth --save`.",
+            paint("auth", "31"),
+        );
+    }
+    println!();
     Ok(())
 }
 
@@ -676,6 +858,12 @@ fn curl(url: &str, key: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
+/// Credentials, not merely anything with TOKEN in the name —
+/// CLAUDE_CODE_MAX_CONTEXT_TOKENS is a number worth reading in `--print`.
+fn is_secret(k: &str) -> bool {
+    k.ends_with("API_KEY") || k.ends_with("AUTH_TOKEN")
+}
+
 fn mask(v: &str) -> String {
     if v.len() <= 10 {
         return "*".repeat(v.len());
@@ -770,11 +958,55 @@ mod tests {
         assert!(can_run("claude", "some-new-model")); // unknown: let it try
     }
 
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn best_for_lists_only_workable_models() {
-        assert!(best_for("codex").contains(&"gpt-5.6-luna"));
-        assert!(!best_for("codex").contains(&"kimi-k3"));
-        assert!(best_for("claude").contains(&"minimax-m3"));
+        let all = ids(&["gpt-5.6-luna", "kimi-k3", "minimax-m3"]);
+        assert_eq!(best_among("codex", &all), ids(&["gpt-5.6-luna"]));
+        assert!(best_among("claude", &all).contains(&"minimax-m3".to_string()));
+    }
+
+    #[test]
+    fn roster_cache_round_trips() {
+        assert_eq!(
+            parse_roster("# written by lulz\nglm-5.3\n\n  kimi-k3  \n"),
+            ids(&["glm-5.3", "kimi-k3"])
+        );
+        assert!(parse_roster("").is_empty());
+    }
+
+    #[test]
+    fn unserved_models_are_caught_before_launch() {
+        let all = ids(&["glm-5.3", "glm-5.3-flash", "qwen3.8-max"]);
+        assert_eq!(ensure_served("glm-5.3".into(), &all).unwrap(), "glm-5.3");
+        let e = ensure_served("glm-9-turbo".into(), &all).unwrap_err();
+        assert!(e.contains("isn't served"));
+        assert!(e.contains("glm-5.3-flash"), "should suggest the family: {e}");
+        // An empty roster means the gateway was unreachable — never a gate.
+        assert!(ensure_served("anything".into(), &[]).is_ok());
+    }
+
+    #[test]
+    fn only_the_model_itself_lands_in_the_cache() {
+        let mut out = String::new();
+        record(&mut out, "claude", "a", &verdict(200));
+        record(&mut out, "claude", "b", &verdict(400));   // rejects tool schemas
+        record(&mut out, "claude", "c", &verdict(401));   // key/routing, not the model
+        record(&mut out, "claude", "d", &verdict(429));   // throttled
+        record(&mut out, "claude", "e", &verdict(500));   // upstream down
+        record(&mut out, "claude", "f", &verdict(0));     // curl never answered
+        assert_eq!(out, "claude:a=ok\nclaude:b=no\n");
+    }
+
+    #[test]
+    fn only_credentials_are_masked() {
+        assert!(is_secret("ANTHROPIC_API_KEY"));
+        assert!(is_secret("OPENCODE_API_KEY"));
+        assert!(is_secret("ANTHROPIC_AUTH_TOKEN"));
+        assert!(!is_secret("CLAUDE_CODE_MAX_CONTEXT_TOKENS"));
     }
 
     #[test]
