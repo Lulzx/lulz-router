@@ -62,11 +62,17 @@ lulz auth --save                    # stash the key in the macOS Keychain
 Model aliases: `qwen`, `minimax`, `glm`, `kimi`, `gpt`/`luna`, `grok`,
 `deepseek`, `mimo`, `hy`.
 
-On every bare interactive `lulz launch claude`, `lulz` fetches `/v1/models`
-directly from OpenCode Go and opens a model picker. Start typing to fuzzy-filter
-the live list (`q38m` finds `qwen3.8-max`), use the arrow keys to move, and press
-Enter. A saved Claude default is initially highlighted. Passing `-m` skips the
-picker, which keeps scripts and aliases non-interactive.
+On every bare interactive `lulz launch claude`, `lulz` fetches both live model
+rosters and opens a model picker. OpenCode Zen's current free models are shown
+first and labelled `[free · Zen]`; paid Zen models are never included. OpenCode
+Go models follow. Start typing to fuzzy-filter the list (`q38m` finds
+`qwen3.8-max`), use the arrow keys to move, and press Enter. A saved Claude
+default is initially highlighted. Passing `-m` skips the picker, which keeps
+scripts and aliases non-interactive.
+
+Zen's `/models` response does not include prices, so `lulz` intersects its live
+roster with the official free lineup. This keeps retired models out without
+ever admitting a paid model merely because Zen advertises it.
 
 ## How it works
 
@@ -107,7 +113,8 @@ result:
 | model | claude | codex | note |
 |---|:--:|:--:|---|
 | qwen3.5/3.6/3.7/3.8, minimax-m2.5/m2.7/m3, kimi-k3 | native | bridged | Messages+tools ok; no `/responses` |
-| deepseek-v4-flash/pro, muse-spark-1.2 | native | native | both |
+| deepseek-v4-flash/pro | native | native | both |
+| muse-spark-1.2/1.3 | bridged | native | Responses-only on the current gateway |
 | gpt-5.6-luna | ❌ | native | Messages 500s for this model |
 | grok-4.5 | ❌ | native | Messages 401s for this model |
 | glm-5…5.3 + glm-5.3-flash | ❌ | bridged | Messages rejects tool schemas / 500s |
@@ -195,9 +202,17 @@ as they arrive, so the TUI stays live. The translation is not cosmetic:
   reasoning *item* is emitted — Codex asks for `reasoning.encrypted_content`,
   which we can't produce, and would replay it on the next turn.
 
-Because the gateway's Messages endpoint is what rejects tool schemas, the same
-bridge in reverse (Messages → Chat) would unlock glm / hy3 / mimo / kimi-k2.x
-for Claude Code too. Same idea, other direction — not built yet.
+For Responses-native models such as Muse Spark 1.3, `lulz` also bridges in the
+other direction. Claude Code sees a catalogued Sonnet-compatible model (so its
+context and tool behavior are correct), while the local bridge rewrites the
+request to the selected provider model and translates streaming text and tool
+calls back to Anthropic Messages events.
+
+The same bridge composition makes Zen's free Chat Completions models available
+to both Claude Code and Codex. `lulz` selects the Zen or Go endpoint from the
+chosen model; OpenCode uses `opencode/<id>` for Zen and `opencode-go/<id>` for
+Go. `OPENCODE_ZEN_API_KEY` is preferred when set, otherwise the existing
+OpenCode credential is reused when one is available.
 
 Debugging: `LULZ_DEBUG=/tmp/bridge.log lulz launch codex -m glm-5.3` mirrors
 every request, translated body, and emitted event into the log.

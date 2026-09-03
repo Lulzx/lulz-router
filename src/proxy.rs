@@ -21,15 +21,167 @@ use serde_json::{json, Map, Value};
 /// practical way to see what a harness actually sent.
 fn debug(tag: &str, body: &str) {
     if let Ok(path) = std::env::var("LULZ_DEBUG") {
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
             let _ = writeln!(f, "[{tag}] {body}");
         }
     }
 }
 
+fn upstream_curl(url: String, key: &str) -> Command {
+    let mut command = Command::new("curl");
+    command.args(["-sS", "-N", "--max-time", "1800", "-X", "POST"]);
+    if !key.is_empty() {
+        command
+            .args(["--variable", "%LULZ_KEY"])
+            .args(["--expand-header", "Authorization: Bearer {{LULZ_KEY}}"])
+            .env("LULZ_KEY", key);
+    }
+    command
+        .args(["-H", "content-type: application/json", "-d", "@-"])
+        .arg(url);
+    command
+}
+
 pub struct Upstream {
     pub base: String,
     pub key: String,
+}
+
+/// A Responses-only provider model exposed as an Anthropic Messages endpoint.
+pub struct ResponsesUpstream {
+    pub base: String,
+    pub key: String,
+    pub model: String,
+}
+
+/// Bind an ephemeral Messages endpoint for Claude Code. The selected provider
+/// model is kept here because Claude itself is deliberately shown a catalogued
+/// Sonnet identity; that prevents unknown-model capability guesses.
+pub fn spawn_anthropic(up: ResponsesUpstream) -> std::io::Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    thread::spawn(move || {
+        for conn in listener.incoming().flatten() {
+            let up = ResponsesUpstream {
+                base: up.base.clone(),
+                key: up.key.clone(),
+                model: up.model.clone(),
+            };
+            thread::spawn(move || {
+                let _ = serve_anthropic(conn, &up);
+            });
+        }
+    });
+    Ok(port)
+}
+
+fn serve_anthropic(mut sock: TcpStream, up: &ResponsesUpstream) -> std::io::Result<()> {
+    let (path, body) = match read_request(&mut sock)? {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+    debug("anthropic-path", &path);
+    let route = path.split('?').next().unwrap_or(&path);
+    if route.ends_with("/messages/count_tokens") {
+        let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        let bytes = req
+            .get("messages")
+            .map(Value::to_string)
+            .unwrap_or_default()
+            .len();
+        let payload = json!({"input_tokens": (bytes / 4).max(1)}).to_string();
+        return write_head(&mut sock, 200, "application/json", Some(payload.as_bytes()));
+    }
+    if !route.ends_with("/messages") {
+        return write_head(
+            &mut sock,
+            404,
+            "application/json",
+            Some(b"{\"error\":\"not found\"}"),
+        );
+    }
+
+    let req: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = json!({"type":"error","error":{"type":"invalid_request_error","message":e.to_string()}});
+            return write_head(
+                &mut sock,
+                400,
+                "application/json",
+                Some(msg.to_string().as_bytes()),
+            );
+        }
+    };
+    let wants_stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let responses = anthropic_to_responses(&req, &up.model);
+    debug("messages-in", &req.to_string());
+    debug("responses-out", &responses.to_string());
+
+    let mut child = upstream_curl(format!("{}/responses", up.base), &up.key)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(responses.to_string().as_bytes())?;
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let mut skipped = String::new();
+    let Some(first) = peek_stream(&mut out, &mut skipped)? else {
+        let mut rest = String::new();
+        let _ = out.read_to_string(&mut rest);
+        let body = format!("{skipped}{rest}");
+        let payload = if serde_json::from_str::<Value>(&body).is_ok() {
+            body
+        } else {
+            json!({"type":"error","error":{"type":"api_error","message":body.trim()}}).to_string()
+        };
+        return write_head(&mut sock, 502, "application/json", Some(payload.as_bytes()));
+    };
+
+    let mut turn = AnthropicTurn::new(&up.model);
+    if wants_stream {
+        write_head(&mut sock, 200, "text/event-stream", None)?;
+        turn.start(&first, &mut |name, value| {
+            anthropic_sse(&mut sock, name, value)
+        })?;
+        turn.feed(&first, &mut |name, value| {
+            anthropic_sse(&mut sock, name, value)
+        })?;
+        let mut line = String::new();
+        while out.read_line(&mut line)? > 0 {
+            turn.feed(&line, &mut |name, value| {
+                anthropic_sse(&mut sock, name, value)
+            })?;
+            line.clear();
+        }
+    } else {
+        let mut sink = |_: &str, _: &Value| Ok(());
+        turn.start(&first, &mut sink)?;
+        turn.feed(&first, &mut sink)?;
+        let mut line = String::new();
+        while out.read_line(&mut line)? > 0 {
+            turn.feed(&line, &mut sink)?;
+            line.clear();
+        }
+        let payload = turn.response().to_string();
+        write_head(&mut sock, 200, "application/json", Some(payload.as_bytes()))?;
+    }
+    let _ = child.wait();
+    Ok(())
+}
+
+fn anthropic_sse(sock: &mut TcpStream, name: &str, value: &Value) -> std::io::Result<()> {
+    debug("anthropic-sse", &value.to_string());
+    sock.write_all(format!("event: {name}\ndata: {value}\n\n").as_bytes())?;
+    sock.flush()
 }
 
 /// Binds an ephemeral loopback port and serves until the process exits.
@@ -38,7 +190,10 @@ pub fn spawn(up: Upstream) -> std::io::Result<u16> {
     let port = listener.local_addr()?.port();
     thread::spawn(move || {
         for conn in listener.incoming().flatten() {
-            let up = Upstream { base: up.base.clone(), key: up.key.clone() };
+            let up = Upstream {
+                base: up.base.clone(),
+                key: up.key.clone(),
+            };
             thread::spawn(move || {
                 let _ = serve(conn, &up);
             });
@@ -53,14 +208,24 @@ fn serve(mut sock: TcpStream, up: &Upstream) -> std::io::Result<()> {
         None => return Ok(()),
     };
     if !path.ends_with("/responses") {
-        return write_head(&mut sock, 404, "application/json", Some(b"{\"error\":\"not found\"}"));
+        return write_head(
+            &mut sock,
+            404,
+            "application/json",
+            Some(b"{\"error\":\"not found\"}"),
+        );
     }
 
     let req: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
             let msg = json!({"error": {"message": format!("bad request: {e}")}});
-            return write_head(&mut sock, 400, "application/json", Some(msg.to_string().as_bytes()));
+            return write_head(
+                &mut sock,
+                400,
+                "application/json",
+                Some(msg.to_string().as_bytes()),
+            );
         }
     };
     let wants_stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
@@ -71,18 +236,16 @@ fn serve(mut sock: TcpStream, up: &Upstream) -> std::io::Result<()> {
     // Upstream over curl: no TLS stack to vendor, and `-N` keeps the SSE live.
     // The key travels in the environment and is expanded by curl itself:
     // spelling it in argv would publish it to every `ps` on the machine.
-    let mut child = Command::new("curl")
-        .args(["-sS", "-N", "--max-time", "1800", "-X", "POST"])
-        .args(["--variable", "%LULZ_KEY"])
-        .args(["--expand-header", "Authorization: Bearer {{LULZ_KEY}}"])
-        .args(["-H", "content-type: application/json", "-d", "@-"])
-        .arg(format!("{}/chat/completions", up.base))
-        .env("LULZ_KEY", &up.key)
+    let mut child = upstream_curl(format!("{}/chat/completions", up.base), &up.key)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    child.stdin.take().unwrap().write_all(chat.to_string().as_bytes())?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(chat.to_string().as_bytes())?;
     let mut out = BufReader::new(child.stdout.take().unwrap());
 
     // Peek for the first payload line: a non-SSE body means the gateway
@@ -90,7 +253,10 @@ fn serve(mut sock: TcpStream, up: &Upstream) -> std::io::Result<()> {
     // than a fake stream.
     let mut skipped = String::new();
     let peeked = peek_stream(&mut out, &mut skipped)?;
-    debug("upstream-first", peeked.as_deref().unwrap_or(&skipped).trim());
+    debug(
+        "upstream-first",
+        peeked.as_deref().unwrap_or(&skipped).trim(),
+    );
     let Some(first) = peeked else {
         let mut rest = String::new();
         let _ = out.read_to_string(&mut rest);
@@ -183,7 +349,10 @@ fn write_head(
     };
     let mut head = format!("HTTP/1.1 {status} {reason}\r\ncontent-type: {ctype}\r\n");
     match body {
-        Some(b) => head.push_str(&format!("content-length: {}\r\nconnection: close\r\n\r\n", b.len())),
+        Some(b) => head.push_str(&format!(
+            "content-length: {}\r\nconnection: close\r\n\r\n",
+            b.len()
+        )),
         None => head.push_str("cache-control: no-cache\r\nconnection: close\r\n\r\n"),
     }
     sock.write_all(head.as_bytes())?;
@@ -246,14 +415,21 @@ pub fn to_chat(req: &Value) -> Value {
     }
 
     let mut body = Map::new();
-    body.insert("model".into(), req.get("model").cloned().unwrap_or(Value::Null));
+    body.insert(
+        "model".into(),
+        req.get("model").cloned().unwrap_or(Value::Null),
+    );
     body.insert("messages".into(), Value::Array(messages));
     body.insert("stream".into(), json!(true));
     body.insert("stream_options".into(), json!({"include_usage": true}));
 
     let mut tools: Vec<Value> = Vec::new();
     let mut dropped: Vec<String> = Vec::new();
-    for t in req.get("tools").and_then(Value::as_array).unwrap_or(&vec![]) {
+    for t in req
+        .get("tools")
+        .and_then(Value::as_array)
+        .unwrap_or(&vec![])
+    {
         match to_chat_tool(t) {
             Some(v) => tools.push(v),
             None => dropped.push(tool_label(t)),
@@ -283,7 +459,10 @@ pub fn to_chat(req: &Value) -> Value {
 }
 
 fn push_input_item(item: &Value, messages: &mut Vec<Value>) {
-    let kind = item.get("type").and_then(Value::as_str).unwrap_or("message");
+    let kind = item
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("message");
     match kind {
         "message" => {
             // Codex writes its harness prompt as `developer`, which Chat
@@ -407,6 +586,356 @@ fn to_chat_tool_choice(tc: &Value) -> Value {
     }
 }
 
+// ------------------------------------------------ Messages <-> Responses --
+
+fn anthropic_to_responses(req: &Value, model: &str) -> Value {
+    let mut input = Vec::new();
+    for message in req
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        match message.get("content") {
+            Some(Value::String(text)) => input.push(response_message(role, text)),
+            Some(Value::Array(parts)) => {
+                let mut text = String::new();
+                for part in parts {
+                    match part.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            text.push_str(part.get("text").and_then(Value::as_str).unwrap_or(""))
+                        }
+                        Some("image") if role == "user" => {
+                            flush_response_text(&mut input, role, &mut text);
+                            if let Some(source) = part.get("source") {
+                                let image_url = match source.get("type").and_then(Value::as_str) {
+                                    Some("base64") => format!(
+                                        "data:{};base64,{}",
+                                        source
+                                            .get("media_type")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("image/png"),
+                                        source.get("data").and_then(Value::as_str).unwrap_or("")
+                                    ),
+                                    _ => source
+                                        .get("url")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_string(),
+                                };
+                                input.push(json!({"role":"user","content":[{"type":"input_image","image_url":image_url}]}));
+                            }
+                        }
+                        Some("tool_use") => {
+                            flush_response_text(&mut input, role, &mut text);
+                            input.push(json!({
+                                "type":"function_call",
+                                "call_id": part.get("id").cloned().unwrap_or(json!("")),
+                                "name": part.get("name").cloned().unwrap_or(json!("")),
+                                "arguments": part.get("input").cloned().unwrap_or(json!({})).to_string(),
+                            }));
+                        }
+                        Some("tool_result") => {
+                            flush_response_text(&mut input, role, &mut text);
+                            input.push(json!({
+                                "type":"function_call_output",
+                                "call_id": part.get("tool_use_id").cloned().unwrap_or(json!("")),
+                                "output": collect_text(part.get("content")),
+                            }));
+                        }
+                        // Thinking signatures are provider-specific. Muse's
+                        // encrypted Responses reasoning cannot be replayed as
+                        // an Anthropic thinking block, so neither direction
+                        // pretends that it can.
+                        _ => {}
+                    }
+                }
+                flush_response_text(&mut input, role, &mut text);
+            }
+            _ => {}
+        }
+    }
+
+    let mut body = Map::new();
+    body.insert("model".into(), json!(model));
+    body.insert("input".into(), Value::Array(input));
+    body.insert("stream".into(), json!(true));
+    let max = req
+        .get("max_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(32000)
+        .max(16);
+    body.insert("max_output_tokens".into(), json!(max));
+    let instructions = collect_text(req.get("system"));
+    if !instructions.is_empty() {
+        body.insert("instructions".into(), json!(instructions));
+    }
+    if let Some(tools) = req.get("tools").and_then(Value::as_array) {
+        body.insert("tools".into(), Value::Array(tools.iter().map(|tool| json!({
+            "type":"function",
+            "name":tool.get("name").cloned().unwrap_or(json!("")),
+            "description":tool.get("description").cloned().unwrap_or(json!("")),
+            "parameters":tool.get("input_schema").cloned().unwrap_or(json!({"type":"object","properties":{}})),
+        })).collect()));
+    }
+    if let Some(choice) = req.get("tool_choice") {
+        let mapped = match choice.get("type").and_then(Value::as_str) {
+            Some("any") => json!("required"),
+            Some("tool") => {
+                json!({"type":"function","name":choice.get("name").cloned().unwrap_or(json!(""))})
+            }
+            Some("none") => json!("none"),
+            _ => json!("auto"),
+        };
+        body.insert("tool_choice".into(), mapped);
+    }
+    for key in ["temperature", "top_p"] {
+        if let Some(value) = req.get(key) {
+            body.insert(key.into(), value.clone());
+        }
+    }
+    Value::Object(body)
+}
+
+fn response_message(role: &str, text: &str) -> Value {
+    let kind = if role == "assistant" {
+        "output_text"
+    } else {
+        "input_text"
+    };
+    json!({"role":role,"content":[{"type":kind,"text":text}]})
+}
+
+fn flush_response_text(input: &mut Vec<Value>, role: &str, text: &mut String) {
+    if !text.is_empty() {
+        input.push(response_message(role, text));
+        text.clear();
+    }
+}
+
+struct AnthropicBlock {
+    index: usize,
+    kind: &'static str,
+    text: String,
+}
+
+struct AnthropicTurn {
+    id: String,
+    model: String,
+    blocks: BTreeMap<u64, AnthropicBlock>,
+    content: Vec<Value>,
+    used_tool: bool,
+    input_tokens: u64,
+    output_tokens: u64,
+    stop_reason: String,
+}
+
+impl AnthropicTurn {
+    fn new(model: &str) -> Self {
+        Self {
+            id: "msg_lulz".into(),
+            model: model.into(),
+            blocks: BTreeMap::new(),
+            content: Vec::new(),
+            used_tool: false,
+            input_tokens: 0,
+            output_tokens: 0,
+            stop_reason: "end_turn".into(),
+        }
+    }
+
+    fn start<F>(&mut self, first: &str, emit: &mut F) -> std::io::Result<()>
+    where
+        F: FnMut(&str, &Value) -> std::io::Result<()>,
+    {
+        if let Some(value) = response_event(first) {
+            if let Some(response) = value.get("response") {
+                self.id = response
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("msg_lulz")
+                    .to_string();
+            }
+        }
+        emit(
+            "message_start",
+            &json!({"type":"message_start","message":{
+                "id":self.id,"type":"message","role":"assistant","model":self.model,
+                "content":[],"stop_reason":Value::Null,"stop_sequence":Value::Null,
+                "usage":{"input_tokens":0,"output_tokens":0}
+            }}),
+        )
+    }
+
+    fn feed<F>(&mut self, line: &str, emit: &mut F) -> std::io::Result<()>
+    where
+        F: FnMut(&str, &Value) -> std::io::Result<()>,
+    {
+        let Some(event) = response_event(line) else {
+            return Ok(());
+        };
+        let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+        let output_index = event
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        match kind {
+            "response.content_part.added"
+                if event.pointer("/part/type").and_then(Value::as_str) == Some("output_text") =>
+            {
+                let index = self.content.len();
+                self.content.push(json!({"type":"text","text":""}));
+                self.blocks.insert(
+                    output_index,
+                    AnthropicBlock {
+                        index,
+                        kind: "text",
+                        text: String::new(),
+                    },
+                );
+                emit(
+                    "content_block_start",
+                    &json!({"type":"content_block_start","index":index,"content_block":{"type":"text","text":""}}),
+                )?;
+            }
+            "response.output_text.delta" => {
+                if let Some(block) = self.blocks.get_mut(&output_index) {
+                    let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
+                    block.text.push_str(delta);
+                    self.content[block.index]["text"] = json!(block.text);
+                    emit(
+                        "content_block_delta",
+                        &json!({"type":"content_block_delta","index":block.index,"delta":{"type":"text_delta","text":delta}}),
+                    )?;
+                }
+            }
+            "response.content_part.done" => self.stop_block(output_index, emit)?,
+            "response.output_item.added"
+                if event.pointer("/item/type").and_then(Value::as_str) == Some("function_call") =>
+            {
+                let item = &event["item"];
+                let index = self.content.len();
+                let id = item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("call_lulz");
+                let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                self.content
+                    .push(json!({"type":"tool_use","id":id,"name":name,"input":{}}));
+                self.blocks.insert(
+                    output_index,
+                    AnthropicBlock {
+                        index,
+                        kind: "tool",
+                        text: String::new(),
+                    },
+                );
+                self.used_tool = true;
+                emit(
+                    "content_block_start",
+                    &json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":id,"name":name,"input":{}}}),
+                )?;
+            }
+            "response.function_call_arguments.delta" => {
+                if let Some(block) = self.blocks.get_mut(&output_index) {
+                    let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
+                    block.text.push_str(delta);
+                    emit(
+                        "content_block_delta",
+                        &json!({"type":"content_block_delta","index":block.index,"delta":{"type":"input_json_delta","partial_json":delta}}),
+                    )?;
+                }
+            }
+            "response.output_item.done"
+                if event.pointer("/item/type").and_then(Value::as_str) == Some("function_call") =>
+            {
+                if let Some(block) = self.blocks.get_mut(&output_index) {
+                    if block.text.is_empty() {
+                        let args = event
+                            .pointer("/item/arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or("{}");
+                        block.text.push_str(args);
+                        emit(
+                            "content_block_delta",
+                            &json!({"type":"content_block_delta","index":block.index,"delta":{"type":"input_json_delta","partial_json":args}}),
+                        )?;
+                    }
+                    self.content[block.index]["input"] =
+                        serde_json::from_str(&block.text).unwrap_or(json!({}));
+                }
+                self.stop_block(output_index, emit)?;
+            }
+            "response.completed" | "response.incomplete" => {
+                if kind == "response.incomplete" {
+                    self.stop_reason = "max_tokens".into();
+                } else if self.used_tool {
+                    self.stop_reason = "tool_use".into();
+                }
+                let usage = &event["response"]["usage"];
+                self.input_tokens = usage
+                    .get("input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                self.output_tokens = usage
+                    .get("output_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                emit(
+                    "message_delta",
+                    &json!({"type":"message_delta","delta":{"stop_reason":self.stop_reason,"stop_sequence":Value::Null},"usage":{"output_tokens":self.output_tokens}}),
+                )?;
+                emit("message_stop", &json!({"type":"message_stop"}))?;
+            }
+            "error" | "response.failed" => {
+                let message = event
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("upstream response failed");
+                emit(
+                    "error",
+                    &json!({"type":"error","error":{"type":"api_error","message":message}}),
+                )?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn stop_block<F>(&mut self, output_index: u64, emit: &mut F) -> std::io::Result<()>
+    where
+        F: FnMut(&str, &Value) -> std::io::Result<()>,
+    {
+        if let Some(block) = self.blocks.remove(&output_index) {
+            let _ = block.kind;
+            emit(
+                "content_block_stop",
+                &json!({"type":"content_block_stop","index":block.index}),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn response(&self) -> Value {
+        json!({"id":self.id,"type":"message","role":"assistant","model":self.model,
+            "content":self.content,"stop_reason":self.stop_reason,"stop_sequence":Value::Null,
+            "usage":{"input_tokens":self.input_tokens,"output_tokens":self.output_tokens}})
+    }
+}
+
+fn response_event(line: &str) -> Option<Value> {
+    let data = line.strip_prefix("data:")?.trim();
+    if data == "[DONE]" {
+        return None;
+    }
+    serde_json::from_str(data).ok()
+}
+
 // ------------------------------------------------- Chat -> Responses ------
 
 const OPEN: &str = "<think>";
@@ -451,6 +980,7 @@ pub struct Turn {
     usage: Option<Value>,
     error: Option<String>,
     done: bool,
+    text_started: bool,
     in_think: bool,
     held: String,
 }
@@ -467,6 +997,7 @@ impl Turn {
             usage: None,
             error: None,
             done: false,
+            text_started: false,
             in_think: false,
             held: String::new(),
         }
@@ -546,6 +1077,15 @@ impl Turn {
                 for (kind, piece) in self.split_think(t) {
                     match kind {
                         Piece::Text => {
+                            if !self.text_started {
+                                self.text_started = true;
+                                emit(&json!({
+                                    "type": "response.content_part.added",
+                                    "item_id": self.msg_id(),
+                                    "output_index": 0, "content_index": 0,
+                                    "part": {"type":"output_text","text":"","annotations":[]},
+                                }))?;
+                            }
                             self.text.push_str(&piece);
                             emit(&json!({
                                 "type": "response.output_text.delta",
@@ -567,7 +1107,11 @@ impl Turn {
                 }
             }
         }
-        if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str) {
+        if let Some(r) = delta
+            .get("reasoning_content")
+            .or_else(|| delta.get("reasoning"))
+            .and_then(Value::as_str)
+        {
             if !r.is_empty() {
                 self.reasoning.push_str(r);
                 emit(&json!({
@@ -665,6 +1209,15 @@ impl Turn {
             if self.in_think {
                 self.reasoning.push_str(&held);
             } else {
+                if !self.text_started {
+                    self.text_started = true;
+                    emit(&json!({
+                        "type": "response.content_part.added",
+                        "item_id": self.msg_id(),
+                        "output_index": 0, "content_index": 0,
+                        "part": {"type":"output_text","text":"","annotations":[]},
+                    }))?;
+                }
                 self.text.push_str(&held);
                 emit(&json!({
                     "type": "response.output_text.delta",
@@ -673,6 +1226,14 @@ impl Turn {
                     "delta": held,
                 }))?;
             }
+        }
+        if self.text_started {
+            emit(&json!({
+                "type": "response.content_part.done",
+                "item_id": self.msg_id(),
+                "output_index": 0, "content_index": 0,
+                "part": {"type":"output_text","text":self.text,"annotations":[]},
+            }))?;
         }
         for (i, item) in self.items().iter().enumerate() {
             emit(&json!({
@@ -738,7 +1299,10 @@ impl Turn {
         });
         if let Some(u) = &self.usage {
             let inp = u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
-            let out = u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0);
+            let out = u
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
             let cached = u
                 .pointer("/prompt_tokens_details/cached_tokens")
                 .and_then(Value::as_u64)
@@ -898,10 +1462,15 @@ mod tests {
         ]);
         let types: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
         assert_eq!(types[0], "response.created");
+        assert!(types.contains(&"response.content_part.added"));
         assert!(types.contains(&"response.output_text.delta"));
+        assert!(types.contains(&"response.content_part.done"));
         assert_eq!(*types.last().unwrap(), "response.completed");
 
-        let done = events.iter().find(|e| e["type"] == "response.output_item.done").unwrap();
+        let done = events
+            .iter()
+            .find(|e| e["type"] == "response.output_item.done")
+            .unwrap();
         assert_eq!(done["item"]["content"][0]["text"], "hello");
         let completed = events.last().unwrap();
         assert_eq!(completed["response"]["usage"]["input_tokens"], 10);
@@ -965,6 +1534,7 @@ mod tests {
     fn reasoning_is_surfaced_but_never_replayed() {
         let events = drain(&[
             r#"data: {"id":"c3","choices":[{"delta":{"reasoning_content":"thinking"}}]}"#,
+            r#"data: {"id":"c3","choices":[{"delta":{"reasoning":" more"}}]}"#,
             "data: [DONE]",
         ]);
         assert!(events
@@ -972,9 +1542,7 @@ mod tests {
             .any(|e| e["type"] == "response.reasoning_summary_text.delta"));
         // No reasoning item: we cannot produce the encrypted content the
         // client would expect to send back on the next turn.
-        assert!(events
-            .iter()
-            .all(|e| e["item"]["type"] != "reasoning"));
+        assert!(events.iter().all(|e| e["item"]["type"] != "reasoning"));
     }
 
     fn text_of(events: &[Value], kind: &str) -> String {
@@ -1015,7 +1583,10 @@ mod tests {
             "data: [DONE]",
         ]);
         assert_eq!(text_of(&events, "response.output_text.delta"), "done");
-        assert_eq!(text_of(&events, "response.reasoning_summary_text.delta"), "why");
+        assert_eq!(
+            text_of(&events, "response.reasoning_summary_text.delta"),
+            "why"
+        );
     }
 
     #[test]
@@ -1069,5 +1640,55 @@ mod tests {
         let last = events.last().unwrap();
         assert_eq!(last["type"], "response.failed");
         assert_eq!(last["response"]["error"]["message"], "model is overloaded");
+    }
+
+    #[test]
+    fn anthropic_request_becomes_responses_with_tools() {
+        let req = json!({
+            "model":"claude-sonnet-4-6", "max_tokens":8,
+            "system":[{"type":"text","text":"be exact"}],
+            "messages":[
+                {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"shell","input":{"cmd":"pwd"}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"/tmp"}]}
+            ],
+            "tools":[{"name":"shell","description":"run","input_schema":{"type":"object","properties":{"cmd":{"type":"string"}}}}]
+        });
+        let got = anthropic_to_responses(&req, "muse-spark-1.3-contributor");
+        assert_eq!(got["model"], "muse-spark-1.3-contributor");
+        assert_eq!(got["instructions"], "be exact");
+        assert_eq!(got["max_output_tokens"], 16);
+        assert_eq!(got["input"][0]["type"], "function_call");
+        assert_eq!(got["input"][1]["type"], "function_call_output");
+        assert_eq!(got["tools"][0]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn responses_tool_stream_becomes_anthropic_events() {
+        let created = r#"data: {"type":"response.created","response":{"id":"resp_1"}}"#;
+        let lines = [
+            r#"data: {"type":"response.output_item.added","output_index":1,"item":{"id":"fc_1","call_id":"call_1","type":"function_call","name":"shell","arguments":""}}"#,
+            r#"data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"cmd\":\"pwd\"}"}"#,
+            r#"data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","arguments":"{\"cmd\":\"pwd\"}"}}"#,
+            r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":7}}}"#,
+        ];
+        let mut turn = AnthropicTurn::new("muse-spark-1.3-contributor");
+        let mut events: Vec<(String, Value)> = Vec::new();
+        let mut emit = |name: &str, value: &Value| {
+            events.push((name.to_string(), value.clone()));
+            Ok(())
+        };
+        turn.start(created, &mut emit).unwrap();
+        for line in lines {
+            turn.feed(line, &mut emit).unwrap();
+        }
+        assert!(events
+            .iter()
+            .any(|(name, value)| name == "content_block_start"
+                && value["content_block"]["type"] == "tool_use"));
+        assert!(events
+            .iter()
+            .any(|(name, value)| name == "message_delta"
+                && value["delta"]["stop_reason"] == "tool_use"));
+        assert_eq!(turn.response()["content"][0]["input"]["cmd"], "pwd");
     }
 }

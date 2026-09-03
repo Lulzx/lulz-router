@@ -21,6 +21,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 // everything else wants the `/v1` root explicitly.
 const GO_ROOT: &str = "https://opencode.ai/zen/go";
 const GO_V1: &str = "https://opencode.ai/zen/go/v1";
+const ZEN_V1: &str = "https://opencode.ai/zen/v1";
 
 const DEFAULT_CLAUDE_MODEL: &str = "minimax-m3";
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-luna";
@@ -41,7 +42,12 @@ struct Caps {
 }
 
 const fn m(id: &'static str, ctx: u32, claude: bool, codex: bool) -> Caps {
-    Caps { id, ctx, claude, codex }
+    Caps {
+        id,
+        ctx,
+        claude,
+        codex,
+    }
 }
 
 const MODELS: &[Caps] = &[
@@ -73,6 +79,9 @@ const MODELS: &[Caps] = &[
     m("minimax-m2.7", 204800, true, false),
     m("minimax-m3", 1000000, true, false),
     m("muse-spark-1.2-contributor", 1048576, true, true),
+    // Muse 1.3 is exposed by OpenCode Go through OpenAI Responses only. The
+    // Claude harness reaches it through lulz's Messages <-> Responses bridge.
+    m("muse-spark-1.3-contributor", 1048576, false, true),
     m("ox-alpha-free", 1000000, false, false),
     m("qwen3.5-plus", 262144, true, false),
     m("qwen3.6-plus", 1000000, true, false),
@@ -81,6 +90,55 @@ const MODELS: &[Caps] = &[
     m("qwen3.8-max", 1000000, true, false),
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ZenWire {
+    Responses,
+    Chat,
+}
+
+struct ZenFree {
+    id: &'static str,
+    ctx: u32,
+    wire: ZenWire,
+}
+
+const ZEN_FREE: &[ZenFree] = &[
+    ZenFree {
+        id: "big-pickle",
+        ctx: 200000,
+        wire: ZenWire::Chat,
+    },
+    ZenFree {
+        id: "mimo-v2.5-free",
+        ctx: 200000,
+        wire: ZenWire::Chat,
+    },
+    ZenFree {
+        id: "ling-3.0-flash-fin-free",
+        ctx: 200000,
+        wire: ZenWire::Chat,
+    },
+    ZenFree {
+        id: "nemotron-3-ultra-free",
+        ctx: 200000,
+        wire: ZenWire::Chat,
+    },
+    ZenFree {
+        id: "nemotron-3.5-lightning-free",
+        ctx: 200000,
+        wire: ZenWire::Chat,
+    },
+    ZenFree {
+        id: "muse-spark-1.3-contributor-free",
+        ctx: 1048576,
+        wire: ZenWire::Responses,
+    },
+    ZenFree {
+        id: "muse-spark-1.2-contributor-free",
+        ctx: 1048576,
+        wire: ZenWire::Responses,
+    },
+];
 
 const ALIASES: &[(&str, &str)] = &[
     ("qwen", "qwen3.8-max"),
@@ -167,6 +225,8 @@ run any coding-agent harness on your OpenCode Go subscription
 
 Bare interactive Claude launches always refresh /v1/models and open the picker.
 Type to fuzzy-filter, use arrows to move, and press enter to select.
+The current OpenCode Zen free models appear first and are labelled `free · Zen`;
+paid Zen models are never included. OpenCode Go models follow them.
 ",
         name = paint("lulz", "35;1"),
         usage = paint("usage", "1"),
@@ -187,6 +247,14 @@ struct LaunchOpts {
     rest: Vec<String>,
 }
 
+type LaunchPlan = (
+    &'static str,
+    String,
+    &'static str,
+    Vec<String>,
+    Vec<(String, String)>,
+);
+
 fn parse_launch(args: &[String]) -> Result<(String, LaunchOpts), String> {
     let mut it = args.iter();
     let harness = it
@@ -194,15 +262,14 @@ fn parse_launch(args: &[String]) -> Result<(String, LaunchOpts), String> {
         .ok_or("which harness? try `lulz launch claude`")?
         .to_string();
 
-    let mut o =
-        LaunchOpts {
-            model: None,
-            small: None,
-            print: false,
-            translate: false,
-            native: false,
-            rest: vec![],
-        };
+    let mut o = LaunchOpts {
+        model: None,
+        small: None,
+        print: false,
+        translate: false,
+        native: false,
+        rest: vec![],
+    };
     let mut passthrough = false;
 
     while let Some(a) = it.next() {
@@ -229,7 +296,10 @@ fn parse_launch(args: &[String]) -> Result<(String, LaunchOpts), String> {
 
 fn cmd_launch(args: &[String]) -> Result<(), String> {
     let (harness, opts) = parse_launch(args)?;
-    let key = find_key()?.value;
+    let go_key = find_key().ok().map(|key| key.value).unwrap_or_default();
+    let zen_key = find_zen_key()
+        .map(|key| key.value)
+        .unwrap_or_else(|| go_key.clone());
     let cfg = read_config();
 
     // A bare interactive launch is a model choice, not a silently changing
@@ -240,7 +310,13 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
 
     // What the gateway actually serves, so a model it has never heard of is a
     // sentence from lulz rather than an opaque API error from the harness.
-    let served = roster(&key, interactive_pick);
+    let zen_served = zen_free_roster();
+    let mut served = zen_served.clone();
+    if !go_key.is_empty() {
+        served.extend(roster(&go_key, interactive_pick));
+    }
+    served.dedup();
+    let is_zen = |model: &str| zen_served.iter().any(|id| id == model);
     let pick = |dflt: &str| -> Result<String, String> {
         let configured = cfg
             .get(&harness)
@@ -263,7 +339,11 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
         if opts.translate || can_run(&harness, model) {
             return Ok(());
         }
-        let alt = if harness == "codex" { "claude" } else { "codex" };
+        let alt = if harness == "codex" {
+            "claude"
+        } else {
+            "codex"
+        };
         let ok = best_for(&harness);
         let shown = ok.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
         let more = if ok.len() > 5 {
@@ -274,7 +354,9 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
         let mut msg =
             format!("`{model}` can't drive {harness} through this gateway.\n  works on {harness}: {shown}{more}");
         if can_run(alt, model) {
-            msg.push_str(&format!("\n  or keep the model: lulz launch {alt} -m {model}"));
+            msg.push_str(&format!(
+                "\n  or keep the model: lulz launch {alt} -m {model}"
+            ));
         }
         if harness == "codex" {
             msg.push_str("\n  or drop --no-translate and let lulz bridge it");
@@ -283,83 +365,197 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
     };
 
     let mut translate = opts.translate;
-    let (bin, model, argv, env): (&str, String, Vec<String>, Vec<(String, String)>) =
-        match harness.as_str() {
-            "claude" => {
-                let model = pick(DEFAULT_CLAUDE_MODEL)?;
+    let (bin, model, provider, argv, env): LaunchPlan = match harness.as_str() {
+        "claude" => {
+            let model = pick(DEFAULT_CLAUDE_MODEL)?;
+            let zen = is_zen(&model);
+            let key = if zen { &zen_key } else { &go_key };
+            // Some gateway models only expose an OpenAI Responses route.
+            // Translate those for Claude instead of rejecting a model the
+            // subscription can serve.
+            translate = zen || opts.translate || (!opts.native && !can_run("claude", &model));
+            if zen && opts.native {
+                return Err(format!("`{model}` is a Zen free model and requires lulz's protocol bridge; remove --no-translate"));
+            } else if !zen && (opts.native || !translate || !can_run("codex", &model)) {
                 gate(&model)?;
-                let small = ensure_served(
-                    opts.small
-                        .clone()
-                        .map(|s| resolve_alias(&s))
-                        .unwrap_or_else(|| DEFAULT_SMALL_MODEL.to_string()),
-                    &served,
-                )?;
-                // The gateway's Messages endpoint authenticates on `x-api-key`
-                // only; ANTHROPIC_AUTH_TOKEN would send `Authorization: Bearer`
-                // and come back 401.
-                let mut env = vec![
-                    ("ANTHROPIC_BASE_URL".into(), GO_ROOT.into()),
-                    ("ANTHROPIC_API_KEY".into(), key.clone()),
-                    ("ANTHROPIC_MODEL".into(), model.clone()),
-                    ("ANTHROPIC_DEFAULT_OPUS_MODEL".into(), model.clone()),
-                    ("ANTHROPIC_DEFAULT_SONNET_MODEL".into(), model.clone()),
-                    ("ANTHROPIC_DEFAULT_HAIKU_MODEL".into(), small.clone()),
-                    ("ANTHROPIC_SMALL_FAST_MODEL".into(), small),
-                    ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".into(), "1".into()),
-                ];
-                if let Some(ctx) = context_window(&model) {
-                    env.push(("CLAUDE_CODE_MAX_CONTEXT_TOKENS".into(), ctx.to_string()));
-                }
-                ("claude", model, opts.rest.clone(), env)
             }
-            "codex" => {
-                let model = pick(DEFAULT_CODEX_MODEL)?;
-                // The gateway serves /responses for a handful of models and
-                // Chat Completions for all of them, so bridge by default
-                // rather than refusing a model that plainly works.
-                translate = opts.translate || (!opts.native && !can_run("codex", &model));
-                if opts.native {
-                    gate(&model)?;
-                }
-                let base = if translate {
+            let small = ensure_served(
+                opts.small
+                    .clone()
+                    .map(|s| resolve_alias(&s))
+                    .unwrap_or_else(|| DEFAULT_SMALL_MODEL.to_string()),
+                &served,
+            )?;
+            // The gateway's Messages endpoint authenticates on `x-api-key`
+            // only; ANTHROPIC_AUTH_TOKEN would send `Authorization: Bearer`
+            // and come back 401.
+            let base = if translate {
+                let upstream = if zen && zen_wire(&model) == Some(ZenWire::Chat) {
                     let port = proxy::spawn(proxy::Upstream {
-                        base: GO_V1.to_string(),
+                        base: ZEN_V1.to_string(),
                         key: key.clone(),
                     })
-                    .map_err(|e| format!("could not start the translator: {e}"))?;
+                    .map_err(|e| format!("could not start the chat translator: {e}"))?;
                     format!("http://127.0.0.1:{port}/v1")
+                } else if zen {
+                    ZEN_V1.to_string()
                 } else {
                     GO_V1.to_string()
                 };
-                let mut argv = vec![
-                    "-c".into(), "model_provider=\"opencodego\"".into(),
-                    "-c".into(), format!(
-                        "model_providers.opencodego.name=\"OpenCode Go{}\"",
-                        if translate { " (lulz)" } else { "" }
-                    ),
-                    "-c".into(), format!("model_providers.opencodego.base_url=\"{base}\""),
-                    "-c".into(), "model_providers.opencodego.env_key=\"OPENCODE_API_KEY\"".into(),
-                    "-c".into(), "model_providers.opencodego.wire_api=\"responses\"".into(),
-                    "-c".into(), format!("model=\"{model}\""),
-                ];
-                argv.extend(opts.rest.clone());
-                let env = vec![("OPENCODE_API_KEY".into(), key.clone())];
-                ("codex", model, argv, env)
+                let port = proxy::spawn_anthropic(proxy::ResponsesUpstream {
+                    base: upstream,
+                    key: key.clone(),
+                    model: model.clone(),
+                })
+                .map_err(|e| format!("could not start the translator: {e}"))?;
+                format!("http://127.0.0.1:{port}")
+            } else {
+                GO_ROOT.to_string()
+            };
+            let mut argv = opts.rest.clone();
+            if translate {
+                // Keep the provider model's real identity in Claude Code,
+                // but describe its harness behavior using Claude's public
+                // custom-picker schema. This avoids unknown-model guesses;
+                // the bridge still forces `model` upstream independently.
+                let settings = serde_json::json!({
+                    "modelPicker": {"options": [{
+                        "model": model,
+                        "label": model,
+                        "behavesAs": "claude-sonnet-4-6"
+                    }]}
+                });
+                argv.splice(0..0, ["--settings".to_string(), settings.to_string()]);
             }
-            "opencode" => {
-                let model = pick(DEFAULT_CLAUDE_MODEL)?;
-                let mut argv = vec!["--model".into(), format!("opencode-go/{model}")];
-                argv.extend(opts.rest.clone());
-                let env = vec![("OPENCODE_API_KEY".into(), key.clone())];
-                ("opencode", model, argv, env)
+            let mut env = vec![
+                ("ANTHROPIC_BASE_URL".into(), base),
+                ("ANTHROPIC_API_KEY".into(), key.clone()),
+                ("ANTHROPIC_MODEL".into(), model.clone()),
+                ("ANTHROPIC_DEFAULT_OPUS_MODEL".into(), model.clone()),
+                ("ANTHROPIC_DEFAULT_SONNET_MODEL".into(), model.clone()),
+                ("ANTHROPIC_DEFAULT_HAIKU_MODEL".into(), small.clone()),
+                ("ANTHROPIC_SMALL_FAST_MODEL".into(), small),
+                (
+                    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".into(),
+                    "1".into(),
+                ),
+            ];
+            if let Some(ctx) = model_context(&model) {
+                env.push(("CLAUDE_CODE_MAX_CONTEXT_TOKENS".into(), ctx.to_string()));
             }
-            other => {
-                return Err(format!(
-                    "unknown harness `{other}` — expected claude, codex or opencode"
-                ))
+            (
+                "claude",
+                model,
+                if zen {
+                    "OpenCode Zen · free"
+                } else {
+                    "OpenCode Go"
+                },
+                argv,
+                env,
+            )
+        }
+        "codex" => {
+            let model = pick(DEFAULT_CODEX_MODEL)?;
+            let zen = is_zen(&model);
+            let key = if zen { &zen_key } else { &go_key };
+            // The gateway serves /responses for a handful of models and
+            // Chat Completions for all of them, so bridge by default
+            // rather than refusing a model that plainly works.
+            translate = opts.translate
+                || if zen {
+                    zen_wire(&model) == Some(ZenWire::Chat)
+                } else {
+                    !opts.native && !can_run("codex", &model)
+                };
+            if zen && opts.native && translate {
+                return Err(format!("`{model}` uses Zen Chat Completions and requires lulz's bridge; remove --no-translate"));
+            } else if !zen && opts.native {
+                gate(&model)?;
             }
-        };
+            let base = if translate {
+                let port = proxy::spawn(proxy::Upstream {
+                    base: if zen {
+                        ZEN_V1.to_string()
+                    } else {
+                        GO_V1.to_string()
+                    },
+                    key: key.clone(),
+                })
+                .map_err(|e| format!("could not start the translator: {e}"))?;
+                format!("http://127.0.0.1:{port}/v1")
+            } else {
+                if zen {
+                    ZEN_V1.to_string()
+                } else {
+                    GO_V1.to_string()
+                }
+            };
+            let provider_id = if zen { "opencodezen" } else { "opencodego" };
+            let mut argv = vec![
+                "-c".into(),
+                format!("model_provider=\"{provider_id}\""),
+                "-c".into(),
+                format!(
+                    "model_providers.{provider_id}.name=\"{}{}\"",
+                    if zen {
+                        "OpenCode Zen · free"
+                    } else {
+                        "OpenCode Go"
+                    },
+                    if translate { " (lulz)" } else { "" }
+                ),
+                "-c".into(),
+                format!("model_providers.{provider_id}.base_url=\"{base}\""),
+                "-c".into(),
+                format!("model_providers.{provider_id}.env_key=\"OPENCODE_API_KEY\""),
+                "-c".into(),
+                format!("model_providers.{provider_id}.wire_api=\"responses\""),
+                "-c".into(),
+                format!("model=\"{model}\""),
+            ];
+            argv.extend(opts.rest.clone());
+            let env = vec![("OPENCODE_API_KEY".into(), key.clone())];
+            (
+                "codex",
+                model,
+                if zen {
+                    "OpenCode Zen · free"
+                } else {
+                    "OpenCode Go"
+                },
+                argv,
+                env,
+            )
+        }
+        "opencode" => {
+            let model = pick(DEFAULT_CLAUDE_MODEL)?;
+            let zen = is_zen(&model);
+            let key = if zen { &zen_key } else { &go_key };
+            let mut argv = vec![
+                "--model".into(),
+                format!("{}/{model}", if zen { "opencode" } else { "opencode-go" }),
+            ];
+            argv.extend(opts.rest.clone());
+            let env = vec![("OPENCODE_API_KEY".into(), key.clone())];
+            (
+                "opencode",
+                model,
+                if zen {
+                    "OpenCode Zen · free"
+                } else {
+                    "OpenCode Go"
+                },
+                argv,
+                env,
+            )
+        }
+        other => {
+            return Err(format!(
+                "unknown harness `{other}` — expected claude, codex or opencode"
+            ))
+        }
+    };
 
     let path = which(bin).ok_or_else(|| format!("`{bin}` is not on your PATH"))?;
 
@@ -371,7 +567,7 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
-    banner(&harness, &model, translate);
+    banner(&harness, &model, provider, translate);
 
     let mut cmd = Command::new(&path);
     cmd.args(&argv);
@@ -393,7 +589,7 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
     Err(format!("failed to exec {}: {}", path.display(), cmd.exec()))
 }
 
-fn banner(harness: &str, model: &str, translate: bool) {
+fn banner(harness: &str, model: &str, provider: &str, translate: bool) {
     if !std::io::stdout().is_terminal() {
         return;
     }
@@ -405,10 +601,15 @@ fn banner(harness: &str, model: &str, translate: bool) {
     eprintln!();
     eprintln!("  {}", paint("lulz", "35;1"));
     eprintln!("  {}   {label}", paint("harness", "2"));
-    eprintln!("  {}  OpenCode Go", paint("provider", "2"));
+    eprintln!("  {}  {provider}", paint("provider", "2"));
     eprintln!("  {}     {model}", paint("model", "2"));
     if translate {
-        eprintln!("  {} responses -> chat completions", paint("bridge", "2"));
+        let direction = if harness == "claude" {
+            "messages <-> responses"
+        } else {
+            "responses -> chat completions"
+        };
+        eprintln!("  {} {direction}", paint("bridge", "2"));
     }
     eprintln!();
 }
@@ -417,34 +618,57 @@ fn banner(harness: &str, model: &str, translate: bool) {
 
 fn cmd_models(args: &[String]) -> Result<(), String> {
     let force = args.iter().any(|a| a == "--refresh" || a == "-r");
-    let key = find_key()?.value;
-    let ids = roster(&key, force);
-    if ids.is_empty() {
+    let key = find_key().ok().map(|key| key.value).unwrap_or_default();
+    let free = zen_free_roster();
+    let go = if key.is_empty() {
+        Vec::new()
+    } else {
+        roster(&key, force)
+    };
+    if free.is_empty() && go.is_empty() {
         return Err(format!("could not read the model list from {GO_V1}/models"));
     }
 
-    println!("\n{}\n", paint("OpenCode Go models", "1"));
+    println!("\n{}\n", paint("models", "1"));
     println!(
-        "  {:<28} {:>9}  {:<8} {:<8} {}",
+        "  {:<38} {:>9}  {:<8} {:<8} {}",
         paint("model", "2"),
         paint("context", "2"),
         paint("claude", "2"),
         paint("codex", "2"),
         paint("opencode", "2")
     );
-    for id in &ids {
-        let ctx = context_window(id)
+    for id in &free {
+        let ctx = model_context(id)
             .map(|c| format!("{}k", c / 1000))
             .unwrap_or_else(|| "?".into());
-        // Codex reaches every model — natively where the gateway serves
-        // /responses, over the bridge everywhere else.
+        let label = format!("{id}  [free · Zen]");
+        let codex = if zen_wire(id) == Some(ZenWire::Responses) {
+            paint("yes", "32")
+        } else {
+            paint("bridge", "36")
+        };
+        println!(
+            "  {label:<48} {ctx:>9}  {:<8} {:<8} {}",
+            paint("bridge", "36"),
+            codex,
+            mark(true)
+        );
+    }
+    if !free.is_empty() && !go.is_empty() {
+        println!();
+    }
+    for id in &go {
+        let ctx = model_context(id)
+            .map(|c| format!("{}k", c / 1000))
+            .unwrap_or_else(|| "?".into());
         let codex = if can_run("codex", id) {
             paint("yes", "32")
         } else {
             paint("bridge", "36")
         };
         println!(
-            "  {id:<28} {ctx:>9}  {:<8} {:<8} {}",
+            "  {id:<38} {ctx:>9}  {:<8} {:<8} {}",
             mark(can_run("claude", id)),
             codex,
             mark(true)
@@ -497,7 +721,10 @@ fn best_for(harness: &str) -> Vec<String> {
 }
 
 fn best_among(harness: &str, ids: &[String]) -> Vec<String> {
-    ids.iter().filter(|id| can_run(harness, id)).cloned().collect()
+    ids.iter()
+        .filter(|id| can_run(harness, id))
+        .cloned()
+        .collect()
 }
 
 fn mark(ok: bool) -> String {
@@ -581,7 +808,7 @@ fn render_picker(
     write!(
         tty,
         "\x1b[u\x1b[J  {} {}\r\n  {} {}_\r\n\r\n",
-        paint("OpenCode Go model", "1"),
+        paint("model", "1"),
         paint("(live)", "2"),
         paint("filter:", "2"),
         query,
@@ -589,14 +816,26 @@ fn render_picker(
     .map_err(|e| e.to_string())?;
 
     if matches.is_empty() {
-        write!(tty, "  {}\r\n", paint("no matching models", "33"))
-            .map_err(|e| e.to_string())?;
+        write!(tty, "  {}\r\n", paint("no matching models", "33")).map_err(|e| e.to_string())?;
     } else {
         let start = selected.saturating_sub(9);
         for (index, id) in matches.iter().enumerate().skip(start).take(10) {
-            let cursor = if index == selected { paint(">", "35;1") } else { " ".into() };
-            let label = if index == selected { paint(id, "1") } else { (*id).clone() };
-            let support = if can_run(harness, id) {
+            let cursor = if index == selected {
+                paint(">", "35;1")
+            } else {
+                " ".into()
+            };
+            let shown = if zen_wire(id).is_some() {
+                format!("{id}  [free · Zen]")
+            } else {
+                (*id).clone()
+            };
+            let label = if index == selected {
+                paint(&shown, "1")
+            } else {
+                shown
+            };
+            let support = if zen_wire(id).is_some() || can_run(harness, id) {
                 String::new()
             } else {
                 format!("  {}", paint("not supported by this harness", "2"))
@@ -604,8 +843,15 @@ fn render_picker(
             write!(tty, "  {cursor} {label}{support}\r\n").map_err(|e| e.to_string())?;
         }
     }
-    write!(tty, "\r\n  {}\r\n", paint("type to filter · ↑↓ move · enter select · ctrl-c cancel", "2"))
-        .map_err(|e| e.to_string())?;
+    write!(
+        tty,
+        "\r\n  {}\r\n",
+        paint(
+            "type to filter · ↑↓ move · enter select · ctrl-c cancel",
+            "2"
+        )
+    )
+    .map_err(|e| e.to_string())?;
     tty.flush().map_err(|e| e.to_string())
 }
 
@@ -618,7 +864,10 @@ fn select_model(harness: &str, ids: &[String], preferred: &str) -> Result<String
         .map_err(|e| format!("terminal: {e}"))?;
     let mut query = String::new();
     let mut matches = filtered_models(ids, &query);
-    let mut selected = matches.iter().position(|id| id.as_str() == preferred).unwrap_or(0);
+    let mut selected = matches
+        .iter()
+        .position(|id| id.as_str() == preferred)
+        .unwrap_or(0);
     write!(tty, "\x1b[s").map_err(|e| e.to_string())?;
 
     loop {
@@ -626,7 +875,8 @@ fn select_model(harness: &str, ids: &[String], preferred: &str) -> Result<String
         render_picker(&mut tty, harness, &matches, &query, selected)?;
 
         let mut byte = [0u8; 1];
-        tty.read_exact(&mut byte).map_err(|e| format!("terminal input: {e}"))?;
+        tty.read_exact(&mut byte)
+            .map_err(|e| format!("terminal input: {e}"))?;
         match byte[0] {
             b'\r' | b'\n' if !matches.is_empty() => {
                 let model = matches[selected].to_string();
@@ -649,7 +899,8 @@ fn select_model(harness: &str, ids: &[String], preferred: &str) -> Result<String
             }
             27 => {
                 let mut seq = [0u8; 2];
-                tty.read_exact(&mut seq).map_err(|e| format!("terminal input: {e}"))?;
+                tty.read_exact(&mut seq)
+                    .map_err(|e| format!("terminal input: {e}"))?;
                 match seq {
                     [b'[', b'A'] if !matches.is_empty() => {
                         selected = selected.checked_sub(1).unwrap_or(matches.len() - 1);
@@ -671,6 +922,44 @@ fn select_model(harness: &str, ids: &[String], preferred: &str) -> Result<String
 }
 
 // ---------------------------------------------------------------- roster ---
+
+fn zen_wire(model: &str) -> Option<ZenWire> {
+    ZEN_FREE
+        .iter()
+        .find(|entry| entry.id == model)
+        .map(|entry| entry.wire)
+}
+
+fn model_context(model: &str) -> Option<u32> {
+    ZEN_FREE
+        .iter()
+        .find(|entry| entry.id == model)
+        .map(|entry| entry.ctx)
+        .or_else(|| context_window(model))
+}
+
+/// The Zen API does not publish pricing in `/models`, so the official free
+/// lineup is an allowlist intersected with the live roster. Paid Zen IDs can
+/// therefore never leak into the picker, while retired free IDs disappear as
+/// soon as Zen stops advertising them.
+fn zen_free_roster() -> Vec<String> {
+    let live = Command::new("curl")
+        .args(["-sS", "--max-time", "20", &format!("{ZEN_V1}/models")])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| json_ids(&String::from_utf8_lossy(&out.stdout)))
+        .unwrap_or_default();
+    filter_zen_free(&live)
+}
+
+fn filter_zen_free(live: &[String]) -> Vec<String> {
+    ZEN_FREE
+        .iter()
+        .filter(|entry| live.iter().any(|id| id == entry.id))
+        .map(|entry| entry.id.to_string())
+        .collect()
+}
 
 /// How long a fetched model list stays fresh before `lulz` re-reads
 /// `/v1/models`. The roster changes when OpenCode adds a model, not by the
@@ -885,7 +1174,12 @@ fn cmd_doctor() -> Result<(), String> {
     for id in &ids {
         let claude = probe(
             &format!("{GO_V1}/messages"),
-            &["-H", &format!("x-api-key: {key}"), "-H", "anthropic-version: 2023-06-01"],
+            &[
+                "-H",
+                &format!("x-api-key: {key}"),
+                "-H",
+                "anthropic-version: 2023-06-01",
+            ],
             &TOOL_PROBE.replace("%M", id),
         );
         let codex = probe(
@@ -895,7 +1189,11 @@ fn cmd_doctor() -> Result<(), String> {
         );
         claude_answered |= matches!(claude, Verdict::Ok);
         codex_answered |= matches!(codex, Verdict::Ok);
-        println!("  {id:<28} claude {:<12} codex {}", show(&claude), show(&codex));
+        println!(
+            "  {id:<28} claude {:<12} codex {}",
+            show(&claude),
+            show(&codex)
+        );
         results.push((id.clone(), claude, codex));
     }
 
@@ -904,9 +1202,10 @@ fn cmd_doctor() -> Result<(), String> {
     let mut auth_failures = 0usize;
     let mut gated: Vec<String> = Vec::new();
     for (id, claude, codex) in results {
-        for (harness, v, answered) in
-            [("claude", claude, claude_answered), ("codex", codex, codex_answered)]
-        {
+        for (harness, v, answered) in [
+            ("claude", claude, claude_answered),
+            ("codex", codex, codex_answered),
+        ] {
             let was_down = matches!(v, Verdict::Down(_));
             let v = settle(v, answered);
             if was_down && matches!(v, Verdict::No) {
@@ -952,7 +1251,15 @@ fn cmd_doctor() -> Result<(), String> {
 
 fn post_status(url: &str, headers: &[&str], body: &str) -> u32 {
     let mut c = Command::new("curl");
-    c.args(["-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "90"]);
+    c.args([
+        "-sS",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        "--max-time",
+        "90",
+    ]);
     c.args(headers);
     c.args(["-H", "content-type: application/json", "-d", body, url]);
     c.output()
@@ -972,19 +1279,51 @@ struct Key {
 fn find_key() -> Result<Key, String> {
     if let Ok(v) = env::var("OPENCODE_API_KEY") {
         if !v.is_empty() {
-            return Ok(Key { value: v, source: "OPENCODE_API_KEY".into() });
+            return Ok(Key {
+                value: v,
+                source: "OPENCODE_API_KEY".into(),
+            });
         }
     }
     if let Some(v) = keychain_get() {
-        return Ok(Key { value: v, source: "macOS Keychain".into() });
+        return Ok(Key {
+            value: v,
+            source: "macOS Keychain".into(),
+        });
     }
     let auth = home().join(".local/share/opencode/auth.json");
     if let Ok(s) = fs::read_to_string(&auth) {
         if let Some(v) = json_key_in_object(&s, "opencode-go", "key") {
-            return Ok(Key { value: v, source: "opencode auth.json".into() });
+            return Ok(Key {
+                value: v,
+                source: "opencode auth.json".into(),
+            });
         }
     }
     Err("no OpenCode Go key found.\n  run `opencode auth login`, or set OPENCODE_API_KEY,\n  then `lulz auth --save` to stash it in the Keychain".into())
+}
+
+fn find_zen_key() -> Option<Key> {
+    if let Ok(value) = env::var("OPENCODE_ZEN_API_KEY") {
+        if !value.is_empty() {
+            return Some(Key {
+                value,
+                source: "OPENCODE_ZEN_API_KEY".into(),
+            });
+        }
+    }
+    let auth = home().join(".local/share/opencode/auth.json");
+    if let Ok(body) = fs::read_to_string(auth) {
+        for provider in ["opencode", "opencode-zen"] {
+            if let Some(value) = json_key_in_object(&body, provider, "key") {
+                return Some(Key {
+                    value,
+                    source: "opencode auth.json".into(),
+                });
+            }
+        }
+    }
+    None
 }
 
 fn cmd_auth(args: &[String]) -> Result<(), String> {
@@ -1002,7 +1341,14 @@ fn cmd_auth(args: &[String]) -> Result<(), String> {
 
 fn keychain_get() -> Option<String> {
     let out = Command::new("security")
-        .args(["find-generic-password", "-s", "lulz", "-a", "opencode-go", "-w"])
+        .args([
+            "find-generic-password",
+            "-s",
+            "lulz",
+            "-a",
+            "opencode-go",
+            "-w",
+        ])
         .stderr(Stdio::null())
         .output()
         .ok()?;
@@ -1019,7 +1365,16 @@ fn keychain_get() -> Option<String> {
 
 fn keychain_set(value: &str) -> Result<(), String> {
     let st = Command::new("security")
-        .args(["add-generic-password", "-U", "-s", "lulz", "-a", "opencode-go", "-w", value])
+        .args([
+            "add-generic-password",
+            "-U",
+            "-s",
+            "lulz",
+            "-a",
+            "opencode-go",
+            "-w",
+            value,
+        ])
         .status()
         .map_err(|e| format!("security: {e}"))?;
     if st.success() {
@@ -1090,7 +1445,14 @@ fn which(bin: &str) -> Option<PathBuf> {
 
 fn curl(url: &str, key: &str) -> Result<String, String> {
     let out = Command::new("curl")
-        .args(["-sS", "--max-time", "20", "-H", &format!("Authorization: Bearer {key}"), url])
+        .args([
+            "-sS",
+            "--max-time",
+            "20",
+            "-H",
+            &format!("Authorization: Bearer {key}"),
+            url,
+        ])
         .output()
         .map_err(|e| format!("curl: {e}"))?;
     if !out.status.success() {
@@ -1179,7 +1541,10 @@ mod tests {
     #[test]
     fn reads_the_opencode_auth_shape() {
         let s = r#"{"anthropic":{"type":"oauth"},"opencode-go":{"type":"api","key":"sk-abc"}}"#;
-        assert_eq!(json_key_in_object(s, "opencode-go", "key").unwrap(), "sk-abc");
+        assert_eq!(
+            json_key_in_object(s, "opencode-go", "key").unwrap(),
+            "sk-abc"
+        );
     }
 
     #[test]
@@ -1191,14 +1556,14 @@ mod tests {
     #[test]
     fn capability_gate_matches_the_probed_gateway() {
         assert!(can_run("claude", "qwen3.8-max"));
-        assert!(!can_run("claude", "glm-5.3"));   // 400s on tool schemas
-        assert!(!can_run("claude", "grok-4.5"));  // messages 401s, codex-only
+        assert!(!can_run("claude", "glm-5.3")); // 400s on tool schemas
+        assert!(!can_run("claude", "grok-4.5")); // messages 401s, codex-only
         assert!(can_run("codex", "grok-4.5"));
         assert!(can_run("codex", "gpt-5.6-luna"));
-        assert!(!can_run("codex", "kimi-k3"));    // no /responses
+        assert!(!can_run("codex", "kimi-k3")); // no /responses
         assert!(can_run("claude", "some-new-model")); // unknown: let it try
-        // Both 500 on /v1/messages however often you ask; luna still has
-        // /responses, so it stays a codex model rather than no model at all.
+                                                      // Both 500 on /v1/messages however often you ask; luna still has
+                                                      // /responses, so it stays a codex model rather than no model at all.
         assert!(!can_run("claude", "glm-5.3-flash"));
         assert!(!can_run("claude", "gpt-5.6-luna"));
     }
@@ -1219,17 +1584,28 @@ mod tests {
         // Others got served, so the gateway was up and this route is the fault.
         assert!(matches!(settle(Verdict::Down(500), true), Verdict::No));
         // Nothing got through all run: an outage proves nothing about a model.
-        assert!(matches!(settle(Verdict::Down(500), false), Verdict::Unknown(500)));
+        assert!(matches!(
+            settle(Verdict::Down(500), false),
+            Verdict::Unknown(500)
+        ));
         // Everything else settles to itself.
         assert!(matches!(settle(Verdict::Ok, false), Verdict::Ok));
-        assert!(matches!(settle(Verdict::Unknown(429), true), Verdict::Unknown(429)));
+        assert!(matches!(
+            settle(Verdict::Unknown(429), true),
+            Verdict::Unknown(429)
+        ));
     }
 
     #[test]
     fn a_settled_outage_is_never_cached() {
         let mut out = String::new();
         record(&mut out, "claude", "up", &settle(Verdict::Down(500), true));
-        record(&mut out, "claude", "down", &settle(Verdict::Down(503), false));
+        record(
+            &mut out,
+            "claude",
+            "down",
+            &settle(Verdict::Down(503), false),
+        );
         assert_eq!(out, "claude:up=no\n");
     }
 
@@ -1254,12 +1630,39 @@ mod tests {
     }
 
     #[test]
+    fn zen_list_is_free_only_and_keeps_free_models_first() {
+        let live = ids(&[
+            "claude-opus-5",
+            "muse-spark-1.3-contributor-free",
+            "big-pickle",
+            "deepseek-v4-flash-free",
+            "mimo-v2.5-free",
+        ]);
+        assert_eq!(
+            filter_zen_free(&live),
+            ids(&[
+                "big-pickle",
+                "mimo-v2.5-free",
+                "muse-spark-1.3-contributor-free"
+            ])
+        );
+        assert_eq!(zen_wire("big-pickle"), Some(ZenWire::Chat));
+        assert_eq!(
+            zen_wire("muse-spark-1.3-contributor-free"),
+            Some(ZenWire::Responses)
+        );
+    }
+
+    #[test]
     fn unserved_models_are_caught_before_launch() {
         let all = ids(&["glm-5.3", "glm-5.3-flash", "qwen3.8-max"]);
         assert_eq!(ensure_served("glm-5.3".into(), &all).unwrap(), "glm-5.3");
         let e = ensure_served("glm-9-turbo".into(), &all).unwrap_err();
         assert!(e.contains("isn't served"));
-        assert!(e.contains("glm-5.3-flash"), "should suggest the family: {e}");
+        assert!(
+            e.contains("glm-5.3-flash"),
+            "should suggest the family: {e}"
+        );
         // An empty roster means the gateway was unreachable — never a gate.
         assert!(ensure_served("anything".into(), &[]).is_ok());
     }
@@ -1268,11 +1671,11 @@ mod tests {
     fn only_the_model_itself_lands_in_the_cache() {
         let mut out = String::new();
         record(&mut out, "claude", "a", &verdict(200));
-        record(&mut out, "claude", "b", &verdict(400));   // rejects tool schemas
-        record(&mut out, "claude", "c", &verdict(401));   // key/routing, not the model
-        record(&mut out, "claude", "d", &verdict(429));   // throttled
-        record(&mut out, "claude", "e", &verdict(500));   // upstream down
-        record(&mut out, "claude", "f", &verdict(0));     // curl never answered
+        record(&mut out, "claude", "b", &verdict(400)); // rejects tool schemas
+        record(&mut out, "claude", "c", &verdict(401)); // key/routing, not the model
+        record(&mut out, "claude", "d", &verdict(429)); // throttled
+        record(&mut out, "claude", "e", &verdict(500)); // upstream down
+        record(&mut out, "claude", "f", &verdict(0)); // curl never answered
         assert_eq!(out, "claude:a=ok\nclaude:b=no\n");
     }
 
@@ -1304,7 +1707,9 @@ mod tests {
     #[test]
     fn launch_args_split_at_dashdash() {
         let a: Vec<String> = ["claude", "-m", "kimi", "--", "--resume"]
-            .iter().map(|s| s.to_string()).collect();
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let (h, o) = parse_launch(&a).unwrap();
         assert_eq!(h, "claude");
         assert_eq!(o.model.unwrap(), "kimi");
