@@ -225,8 +225,8 @@ run any coding-agent harness on your OpenCode Go subscription
 
 Bare interactive Claude launches always refresh /v1/models and open the picker.
 Type to fuzzy-filter, use arrows to move, and press enter to select.
-The current OpenCode Zen free models appear first and are labelled `free · Zen`;
-paid Zen models are never included. OpenCode Go models follow them.
+The current OpenCode Zen free models appear first and are labelled `[Zen]`;
+paid Zen models are never included. OpenCode Go models follow them, labelled `[Go]`.
 ",
         name = paint("lulz", "35;1"),
         usage = paint("usage", "1"),
@@ -328,7 +328,7 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
             if served.is_empty() {
                 return Err(format!("could not read the model list from {GO_V1}/models"));
             }
-            select_model(&harness, &served, &configured)?
+            select_model(&served, &configured)?
         } else {
             configured
         };
@@ -642,7 +642,7 @@ fn cmd_models(args: &[String]) -> Result<(), String> {
         let ctx = model_context(id)
             .map(|c| format!("{}k", c / 1000))
             .unwrap_or_else(|| "?".into());
-        let label = format!("{id}  [free · Zen]");
+        let label = format!("{id}  [Zen]");
         let codex = if zen_wire(id) == Some(ZenWire::Responses) {
             paint("yes", "32")
         } else {
@@ -662,13 +662,14 @@ fn cmd_models(args: &[String]) -> Result<(), String> {
         let ctx = model_context(id)
             .map(|c| format!("{}k", c / 1000))
             .unwrap_or_else(|| "?".into());
+        let label = format!("{id}  [Go]");
         let codex = if can_run("codex", id) {
             paint("yes", "32")
         } else {
             paint("bridge", "36")
         };
         println!(
-            "  {id:<38} {ctx:>9}  {:<8} {:<8} {}",
+            "  {label:<48} {ctx:>9}  {:<8} {:<8} {}",
             mark(can_run("claude", id)),
             codex,
             mark(true)
@@ -800,7 +801,6 @@ impl Drop for RawTerminal {
 
 fn render_picker(
     tty: &mut fs::File,
-    harness: &str,
     matches: &[&String],
     query: &str,
     selected: usize,
@@ -826,21 +826,16 @@ fn render_picker(
                 " ".into()
             };
             let shown = if zen_wire(id).is_some() {
-                format!("{id}  [free · Zen]")
+                format!("{id}  [Zen]")
             } else {
-                (*id).clone()
+                format!("{id}  [Go]")
             };
             let label = if index == selected {
                 paint(&shown, "1")
             } else {
                 shown
             };
-            let support = if zen_wire(id).is_some() || can_run(harness, id) {
-                String::new()
-            } else {
-                format!("  {}", paint("not supported by this harness", "2"))
-            };
-            write!(tty, "  {cursor} {label}{support}\r\n").map_err(|e| e.to_string())?;
+            write!(tty, "  {cursor} {label}\r\n").map_err(|e| e.to_string())?;
         }
     }
     write!(
@@ -855,7 +850,7 @@ fn render_picker(
     tty.flush().map_err(|e| e.to_string())
 }
 
-fn select_model(harness: &str, ids: &[String], preferred: &str) -> Result<String, String> {
+fn select_model(ids: &[String], preferred: &str) -> Result<String, String> {
     let _raw = RawTerminal::enter()?;
     let mut tty = fs::OpenOptions::new()
         .read(true)
@@ -872,7 +867,7 @@ fn select_model(harness: &str, ids: &[String], preferred: &str) -> Result<String
 
     loop {
         selected = selected.min(matches.len().saturating_sub(1));
-        render_picker(&mut tty, harness, &matches, &query, selected)?;
+        render_picker(&mut tty, &matches, &query, selected)?;
 
         let mut byte = [0u8; 1];
         tty.read_exact(&mut byte)
