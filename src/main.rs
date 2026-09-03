@@ -9,7 +9,7 @@ mod proxy;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -97,7 +97,14 @@ const ALIASES: &[(&str, &str)] = &[
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
-    let head = args.first().map(String::as_str).unwrap_or("help");
+    if args.is_empty() {
+        if let Err(e) = cmd_launch(&["claude".to_string()]) {
+            eprintln!("{} {e}", paint("error", "31;1"));
+            std::process::exit(1);
+        }
+        return;
+    }
+    let head = args.first().map(String::as_str).unwrap();
 
     let r = match head {
         "launch" | "run" => cmd_launch(&args[1..]),
@@ -129,6 +136,7 @@ fn help() {
 run any coding-agent harness on your OpenCode Go subscription
 
 {usage}
+  lulz                              # same as: lulz launch claude
   lulz launch <harness> [-m <model>] [-- <harness args>...]
   lulz models [--refresh]
   lulz auth [--save]
@@ -141,7 +149,7 @@ run any coding-agent harness on your OpenCode Go subscription
   opencode    OpenCode          (native)
 
 {examples}
-  lulz launch claude
+  lulz launch claude                    # live searchable model picker
   lulz launch claude -m minimax-m3
   lulz launch codex -m gpt-5.6-luna
   lulz launch codex -m qwen3.8-max     # bridged automatically
@@ -156,6 +164,9 @@ run any coding-agent harness on your OpenCode Go subscription
                       directly, which only works for a few models)
       --print         print the resolved command and env, then exit
   -r, --refresh       (models) re-read /v1/models instead of the 12h cache
+
+Bare interactive Claude launches always refresh /v1/models and open the picker.
+Type to fuzzy-filter, use arrows to move, and press enter to select.
 ",
         name = paint("lulz", "35;1"),
         usage = paint("usage", "1"),
@@ -221,15 +232,30 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
     let key = find_key()?.value;
     let cfg = read_config();
 
+    // A bare interactive launch is a model choice, not a silently changing
+    // compiled-in default. Force a live roster fetch every time the picker is
+    // shown so newly-added OpenCode Go models are immediately available.
+    let interactive_pick =
+        harness == "claude" && opts.model.is_none() && std::io::stdin().is_terminal();
+
     // What the gateway actually serves, so a model it has never heard of is a
     // sentence from lulz rather than an opaque API error from the harness.
-    let served = roster(&key, false);
+    let served = roster(&key, interactive_pick);
     let pick = |dflt: &str| -> Result<String, String> {
-        let raw = opts
-            .model
-            .clone()
-            .or_else(|| cfg.get(&harness).cloned())
+        let configured = cfg
+            .get(&harness)
+            .cloned()
             .unwrap_or_else(|| dflt.to_string());
+        let raw = if let Some(model) = opts.model.clone() {
+            model
+        } else if interactive_pick {
+            if served.is_empty() {
+                return Err(format!("could not read the model list from {GO_V1}/models"));
+            }
+            select_model(&harness, &served, &configured)?
+        } else {
+            configured
+        };
         ensure_served(resolve_alias(&raw), &served)
     };
 
@@ -490,6 +516,160 @@ fn resolve_alias(raw: &str) -> String {
         .unwrap_or_else(|| raw.to_string())
 }
 
+// ---------------------------------------------------------- model picker ---
+
+/// Tiny dependency-free fuzzy matcher. Characters must occur in order, so
+/// `q38m` finds `qwen3.8-max` and ordinary substrings behave as expected.
+fn fuzzy_matches(candidate: &str, query: &str) -> bool {
+    let mut chars = candidate.chars().flat_map(char::to_lowercase);
+    query
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .all(|wanted| chars.by_ref().any(|got| got == wanted))
+}
+
+fn filtered_models<'a>(ids: &'a [String], query: &str) -> Vec<&'a String> {
+    ids.iter().filter(|id| fuzzy_matches(id, query)).collect()
+}
+
+/// Restores the user's terminal even when selection is cancelled or errors.
+struct RawTerminal {
+    saved: String,
+}
+
+impl RawTerminal {
+    fn enter() -> Result<Self, String> {
+        let input = fs::File::open("/dev/tty").map_err(|e| format!("terminal: {e}"))?;
+        let out = Command::new("stty")
+            .arg("-g")
+            .stdin(input)
+            .output()
+            .map_err(|e| format!("stty: {e}"))?;
+        if !out.status.success() {
+            return Err("could not read terminal settings".into());
+        }
+        let saved = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let input = fs::File::open("/dev/tty").map_err(|e| format!("terminal: {e}"))?;
+        let status = Command::new("stty")
+            .args(["raw", "-echo"])
+            .stdin(input)
+            .status()
+            .map_err(|e| format!("stty: {e}"))?;
+        if !status.success() {
+            return Err("could not enter interactive terminal mode".into());
+        }
+        Ok(Self { saved })
+    }
+}
+
+impl Drop for RawTerminal {
+    fn drop(&mut self) {
+        if let Ok(input) = fs::File::open("/dev/tty") {
+            let _ = Command::new("stty").arg(&self.saved).stdin(input).status();
+        }
+    }
+}
+
+fn render_picker(
+    tty: &mut fs::File,
+    harness: &str,
+    matches: &[&String],
+    query: &str,
+    selected: usize,
+) -> Result<(), String> {
+    write!(
+        tty,
+        "\x1b[u\x1b[J  {} {}\r\n  {} {}_\r\n\r\n",
+        paint("OpenCode Go model", "1"),
+        paint("(live)", "2"),
+        paint("filter:", "2"),
+        query,
+    )
+    .map_err(|e| e.to_string())?;
+
+    if matches.is_empty() {
+        write!(tty, "  {}\r\n", paint("no matching models", "33"))
+            .map_err(|e| e.to_string())?;
+    } else {
+        let start = selected.saturating_sub(9);
+        for (index, id) in matches.iter().enumerate().skip(start).take(10) {
+            let cursor = if index == selected { paint(">", "35;1") } else { " ".into() };
+            let label = if index == selected { paint(id, "1") } else { (*id).clone() };
+            let support = if can_run(harness, id) {
+                String::new()
+            } else {
+                format!("  {}", paint("not supported by this harness", "2"))
+            };
+            write!(tty, "  {cursor} {label}{support}\r\n").map_err(|e| e.to_string())?;
+        }
+    }
+    write!(tty, "\r\n  {}\r\n", paint("type to filter · ↑↓ move · enter select · ctrl-c cancel", "2"))
+        .map_err(|e| e.to_string())?;
+    tty.flush().map_err(|e| e.to_string())
+}
+
+fn select_model(harness: &str, ids: &[String], preferred: &str) -> Result<String, String> {
+    let _raw = RawTerminal::enter()?;
+    let mut tty = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|e| format!("terminal: {e}"))?;
+    let mut query = String::new();
+    let mut matches = filtered_models(ids, &query);
+    let mut selected = matches.iter().position(|id| id.as_str() == preferred).unwrap_or(0);
+    write!(tty, "\x1b[s").map_err(|e| e.to_string())?;
+
+    loop {
+        selected = selected.min(matches.len().saturating_sub(1));
+        render_picker(&mut tty, harness, &matches, &query, selected)?;
+
+        let mut byte = [0u8; 1];
+        tty.read_exact(&mut byte).map_err(|e| format!("terminal input: {e}"))?;
+        match byte[0] {
+            b'\r' | b'\n' if !matches.is_empty() => {
+                let model = matches[selected].to_string();
+                write!(tty, "\x1b[u\x1b[J").map_err(|e| e.to_string())?;
+                return Ok(model);
+            }
+            3 => {
+                write!(tty, "\x1b[u\x1b[J").map_err(|e| e.to_string())?;
+                return Err("model selection cancelled".into());
+            }
+            8 | 127 => {
+                query.pop();
+                matches = filtered_models(ids, &query);
+                selected = 0;
+            }
+            b'\t' => {
+                if !matches.is_empty() {
+                    selected = (selected + 1) % matches.len();
+                }
+            }
+            27 => {
+                let mut seq = [0u8; 2];
+                tty.read_exact(&mut seq).map_err(|e| format!("terminal input: {e}"))?;
+                match seq {
+                    [b'[', b'A'] if !matches.is_empty() => {
+                        selected = selected.checked_sub(1).unwrap_or(matches.len() - 1);
+                    }
+                    [b'[', b'B'] if !matches.is_empty() => {
+                        selected = (selected + 1) % matches.len();
+                    }
+                    _ => {}
+                }
+            }
+            c if c.is_ascii_graphic() || c == b' ' => {
+                query.push(c as char);
+                matches = filtered_models(ids, &query);
+                selected = 0;
+            }
+            _ => {}
+        }
+    }
+}
+
 // ---------------------------------------------------------------- roster ---
 
 /// How long a fetched model list stays fresh before `lulz` re-reads
@@ -568,7 +748,7 @@ fn known_models() -> Vec<String> {
 /// Reject a model the gateway doesn't serve *before* the harness starts and
 /// reports it as a bare API error.
 fn ensure_served(model: String, roster: &[String]) -> Result<String, String> {
-    if roster.is_empty() || roster.iter().any(|id| *id == model) {
+    if roster.is_empty() || roster.contains(&model) {
         return Ok(model);
     }
     // Everything up to the first digit — `glm-5.4-flash` suggests the glm family.
@@ -1108,6 +1288,17 @@ mod tests {
     fn aliases_expand() {
         assert_eq!(resolve_alias("qwen"), "qwen3.8-max");
         assert_eq!(resolve_alias("glm-5.1"), "glm-5.1");
+    }
+
+    #[test]
+    fn fuzzy_model_filter_accepts_substrings_and_initials() {
+        assert!(fuzzy_matches("qwen3.8-max", "3.8"));
+        assert!(fuzzy_matches("qwen3.8-max", "q38m"));
+        assert!(fuzzy_matches("deepseek-v4-pro", "deep pro"));
+        assert!(!fuzzy_matches("minimax-m3", "qwen"));
+
+        let all = ids(&["deepseek-v4-pro", "qwen3.8-max", "qwen3.7-plus"]);
+        assert_eq!(filtered_models(&all, "q38"), vec![&all[1]]);
     }
 
     #[test]

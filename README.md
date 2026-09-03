@@ -44,7 +44,8 @@ std plus `curl` and `security`.
 ## Use
 
 ```sh
-lulz launch claude                  # Claude Code on minimax-m3
+lulz                               # same as: lulz launch claude
+lulz launch claude                  # live searchable model picker
 lulz launch claude -m deepseek-v4-pro
 lulz launch codex -m gpt-5.6-luna
 lulz launch opencode -m glm-5.3
@@ -60,6 +61,12 @@ lulz auth --save                    # stash the key in the macOS Keychain
 
 Model aliases: `qwen`, `minimax`, `glm`, `kimi`, `gpt`/`luna`, `grok`,
 `deepseek`, `mimo`, `hy`.
+
+On every bare interactive `lulz launch claude`, `lulz` fetches `/v1/models`
+directly from OpenCode Go and opens a model picker. Start typing to fuzzy-filter
+the live list (`q38m` finds `qwen3.8-max`), use the arrow keys to move, and press
+Enter. A saved Claude default is initially highlighted. Passing `-m` skips the
+picker, which keeps scripts and aliases non-interactive.
 
 ## How it works
 
@@ -108,7 +115,8 @@ result:
 
 The *roster* is never hardcoded: `lulz` reads the gateway's own
 `/v1/models` and caches the ids at `~/.cache/lulz/models` for 12 hours, so a
-model OpenCode shipped this morning shows up without a `lulz` release. The
+model OpenCode shipped this morning shows up without a `lulz` release. Bare
+interactive launches bypass that cache and fetch the latest list. The
 table above only supplies what that endpoint doesn't report — protocol support
 and context window. `--refresh` re-reads it on demand; if the fetch fails,
 `lulz` falls back to the stale cache and, failing that, stops gating.
