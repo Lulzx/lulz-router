@@ -22,9 +22,15 @@ fetch() { # url -> stdout
     fi
 }
 
-download() { # url file
+download() { # url file  (quiet; for small files)
     if have curl; then curl -fsSL -o "$2" "$1"
     else wget -qO "$2" "$1"
+    fi
+}
+
+download_shown() { # url file  (progress bar; for the binary)
+    if have curl; then curl -fL -# -o "$2" "$1"
+    else wget -q --show-progress -O "$2" "$1"
     fi
 }
 
@@ -72,7 +78,7 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
 say "==> fetching $BIN $VERSION for $TARGET"
-download "$URL" "$TMP/$ASSET" 2>/dev/null || from_source
+download_shown "$URL" "$TMP/$ASSET" || from_source
 
 # Checksums are published alongside the asset; a tampered or truncated
 # download should fail loudly rather than land on your PATH.
