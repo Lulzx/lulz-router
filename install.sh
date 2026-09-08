@@ -15,22 +15,40 @@ say() { printf '%s\n' "$*" >&2; }
 die() { printf 'install: %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Give up on a connection that never opens, and on one that opens but then
+# stalls -- a wedged CDN edge should surface as an error, not an eternal
+# progress bar. Transient failures get a couple of retries first.
+TIMEOUTS_CURL="--connect-timeout 10 --speed-limit 1024 --speed-time 20 --retry 2 --retry-connrefused"
+TIMEOUTS_WGET="--timeout=20 --tries=3"
+
 fetch() { # url -> stdout
-    if have curl; then curl -fsSL "$1"
-    elif have wget; then wget -qO- "$1"
+    if have curl; then curl -fsSL $TIMEOUTS_CURL "$1"
+    elif have wget; then wget -q $TIMEOUTS_WGET -O- "$1"
     else die "need curl or wget"
     fi
 }
 
 download() { # url file  (quiet; for small files)
-    if have curl; then curl -fsSL -o "$2" "$1"
-    else wget -qO "$2" "$1"
+    if have curl; then curl -fsSL $TIMEOUTS_CURL -o "$2" "$1"
+    else wget -q $TIMEOUTS_WGET -O "$2" "$1"
     fi
 }
 
 download_shown() { # url file  (progress bar; for the binary)
-    if have curl; then curl -fL -# -o "$2" "$1"
-    else wget -q --show-progress -O "$2" "$1"
+    if have curl; then curl -fL -# $TIMEOUTS_CURL -o "$2" "$1"
+    else wget -q --show-progress $TIMEOUTS_WGET -O "$2" "$1"
+    fi
+}
+
+# "Is there an asset for this platform?" -- answered by the status line rather
+# than by a download exit code, because curl reports a 404 as 22 or 56
+# depending on the HTTP version it negotiated.
+asset_status() { # url -> http status, empty if the request never completed
+    if have curl; then
+        curl -sIL $TIMEOUTS_CURL -o /dev/null -w '%{http_code}' "$1" 2>/dev/null
+    else
+        wget -q $TIMEOUTS_WGET --spider --server-response "$1" 2>&1 \
+            | awk '/^ *HTTP\//{s=$2} END{print s}'
     fi
 }
 
@@ -75,10 +93,29 @@ ASSET="$BIN-$VERSION-$TARGET.tar.gz"
 URL="https://github.com/$REPO/releases/download/$VERSION/$ASSET"
 
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT INT TERM
+# A bare INT trap would clean up and then let execution fall through to the
+# `|| from_source` below -- so Ctrl-C during the download would silently start
+# a from-source build. Exit for real instead.
+trap 'rm -rf "$TMP"' EXIT
+trap 'rm -rf "$TMP"; say ""; say "==> interrupted"; exit 130' INT TERM
+
+# A missing asset means this platform is unsupported -- build from source.
+# Anything else (timeout, reset, stalled transfer) is a network fault, and
+# quietly starting a ten-minute rustc run is the wrong answer to that.
+case "$(asset_status "$URL")" in
+    404) from_source ;;
+esac
 
 say "==> fetching $BIN $VERSION for $TARGET"
-download_shown "$URL" "$TMP/$ASSET" || from_source
+rc=0
+download_shown "$URL" "$TMP/$ASSET" || rc=$?
+if [ "$rc" -ne 0 ]; then
+    die "download failed (curl/wget exit $rc)
+  $URL
+  the release asset exists but could not be fetched -- likely a network or CDN
+  hiccup. re-run to retry, or build from source:
+    cargo install --git https://github.com/$REPO"
+fi
 
 # Checksums are published alongside the asset; a tampered or truncated
 # download should fail loudly rather than land on your PATH.
