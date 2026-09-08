@@ -23,8 +23,8 @@ const GO_ROOT: &str = "https://opencode.ai/zen/go";
 const GO_V1: &str = "https://opencode.ai/zen/go/v1";
 const ZEN_V1: &str = "https://opencode.ai/zen/v1";
 
-const DEFAULT_CLAUDE_MODEL: &str = "minimax-m3";
-const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-luna";
+const DEFAULT_CLAUDE_MODEL: &str = "muse-spark-1.3-contributor";
+const DEFAULT_CODEX_MODEL: &str = "muse-spark-1.3-contributor";
 const DEFAULT_SMALL_MODEL: &str = "deepseek-v4-flash";
 
 /// What each model can actually drive, probed against the live gateway
@@ -52,6 +52,7 @@ const fn m(id: &'static str, ctx: u32, claude: bool, codex: bool) -> Caps {
 
 const MODELS: &[Caps] = &[
     m("deepseek-v4-flash", 1000000, true, true),
+    m("deepseek-v4-flash-vision-exp", 1000000, true, true),
     m("deepseek-v4-pro", 1000000, true, true),
     m("glm-5", 202752, false, false),
     m("glm-5.1", 202752, false, false),
@@ -65,12 +66,15 @@ const MODELS: &[Caps] = &[
     // Anthropic shape 500s the same way; /responses works, so codex-only.
     m("gpt-5.6-luna", 1050000, false, true),
     m("grok-4.5", 500000, false, true),
+    m("grok-4.6", 500000, false, true),
     m("hy3", 256000, false, false),
     m("hy3-preview", 256000, false, false),
+    m("hy4-preview", 256000, false, false),
     m("kimi-k2.5", 262144, false, false),
     m("kimi-k2.6", 262144, false, false),
     m("kimi-k2.7-code", 262144, false, false),
     m("kimi-k3", 1048576, true, false),
+    m("longcat-2.0", 262144, false, false),
     m("mimo-v2-omni", 262144, false, false),
     m("mimo-v2-pro", 1048576, false, false),
     m("mimo-v2.5", 1000000, false, false),
@@ -78,10 +82,11 @@ const MODELS: &[Caps] = &[
     m("minimax-m2.5", 204800, true, false),
     m("minimax-m2.7", 204800, true, false),
     m("minimax-m3", 1000000, true, false),
-    m("muse-spark-1.2-contributor", 1048576, true, true),
-    // Muse 1.3 is exposed by OpenCode Go through OpenAI Responses only. The
+    m("muse-spark-1.2-contributor", 1048576, false, true),
+    // Muse is exposed by OpenCode Go through OpenAI Responses only. The
     // Claude harness reaches it through lulz's Messages <-> Responses bridge.
     m("muse-spark-1.3-contributor", 1048576, false, true),
+    m("omen-alpha", 1000000, false, false),
     m("ox-alpha-free", 1000000, false, false),
     m("qwen3.5-plus", 262144, true, false),
     m("qwen3.6-plus", 1000000, true, false),
@@ -150,6 +155,7 @@ const ALIASES: &[(&str, &str)] = &[
     ("grok", "grok-4.5"),
     ("deepseek", "deepseek-v4-pro"),
     ("mimo", "mimo-v2.5-pro"),
+    ("muse", "muse-spark-1.3-contributor"),
     ("hy", "hy3"),
 ];
 
@@ -184,6 +190,25 @@ fn main() {
     }
     let head = args.first().map(String::as_str).unwrap();
 
+    // `lulz --default <model>` remembers one model for every harness that
+    // has no per-harness default yet. Bare position only — anywhere else the
+    // flag belongs to the harness, not to lulz.
+    if head == "--default" || head.starts_with("--default=") {
+        let raw = if let Some(v) = head.strip_prefix("--default=") {
+            v.to_string()
+        } else if let Some(v) = args.get(1) {
+            v.clone()
+        } else {
+            eprintln!("{} usage: lulz --default <model>", paint("error", "31;1"));
+            std::process::exit(1);
+        };
+        if let Err(e) = set_global_default(&raw) {
+            eprintln!("{} {e}", paint("error", "31;1"));
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let r = match head {
         "launch" | "run" => cmd_launch(&args[1..]),
         "models" | "model" | "ls" => cmd_models(&args[1..]),
@@ -216,6 +241,7 @@ run any coding-agent harness on your OpenCode Go subscription
 {usage}
   lulz                              # pick a harness, then pick a model
   lulz launch [<harness>] [-m <model>] [-- <harness args>...]
+  lulz --default <model>            # remember one model for every harness
   lulz models [--refresh]
   lulz auth [--save]
   lulz doctor
@@ -236,9 +262,10 @@ run any coding-agent harness on your OpenCode Go subscription
   lulz launch codex -m qwen3.8-max     # bridged automatically
   lulz launch claude -- --resume
   lulz default claude qwen3.8-max     # override the default
+  lulz --default muse                 # same, for every harness at once
 
 {flags}
-  -m, --model <id>    model to run (alias ok: qwen, glm, kimi, gpt, grok, ...)
+  -m, --model <id>    model to run (alias ok: qwen, glm, kimi, gpt, grok, muse, ...)
       --small <id>    background/fast model for Claude Code
   -t, --translate     force the Responses -> Chat Completions bridge
       --no-translate  refuse instead of bridging (codex talks to the gateway
@@ -364,8 +391,11 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
     };
     let is_zen = |model: &str| zen_served.iter().any(|id| id == model);
     let pick = |dflt: &str| -> Result<String, String> {
+        // Per-harness default wins, then the global `lulz --default`
+        // model, then the compiled-in one.
         let configured = cfg
             .get(&harness)
+            .or_else(|| cfg.get("default"))
             .cloned()
             .unwrap_or_else(|| dflt.to_string());
         let raw = if let Some(model) = opts.model.clone() {
@@ -455,6 +485,7 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
                     let port = proxy::spawn(proxy::Upstream {
                         base: ZEN_V1.to_string(),
                         key: key.clone(),
+                        session: proxy::session_id(),
                     })
                     .map_err(|e| format!("could not start the chat translator: {e}"))?;
                     format!("http://127.0.0.1:{port}/v1")
@@ -467,6 +498,7 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
                     base: upstream,
                     key: key.clone(),
                     model: model.clone(),
+                    session: proxy::session_id(),
                 })
                 .map_err(|e| format!("could not start the translator: {e}"))?;
                 format!("http://127.0.0.1:{port}")
@@ -542,6 +574,7 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
                         GO_V1.to_string()
                     },
                     key: key.clone(),
+                    session: proxy::session_id(),
                 })
                 .map_err(|e| format!("could not start the translator: {e}"))?;
                 format!("http://127.0.0.1:{port}/v1")
@@ -681,11 +714,12 @@ fn cmd_models(args: &[String]) -> Result<(), String> {
     let force = args.iter().any(|a| a == "--refresh" || a == "-r");
     let key = find_key().ok().map(|key| key.value).unwrap_or_default();
     let free = zen_free_roster();
-    let go = if key.is_empty() {
+    // The default prints first so the eye lands on the common choice.
+    let go = pin_defaults(if key.is_empty() {
         Vec::new()
     } else {
         roster(&key, force)
-    };
+    });
     if free.is_empty() && go.is_empty() {
         return Err(format!("could not read the model list from {GO_V1}/models"));
     }
@@ -1112,6 +1146,20 @@ fn merge_served(mut zen: Vec<String>, go: Vec<String>) -> Vec<String> {
     zen
 }
 
+/// The compiled-in defaults float to the top of `lulz models` in harness
+/// order (claude's, then codex's when they differ); everything else keeps
+/// the gateway's order.
+fn pin_defaults(mut ids: Vec<String>) -> Vec<String> {
+    let mut pinned = Vec::new();
+    for d in [DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL] {
+        if let Some(i) = ids.iter().position(|id| id == d) {
+            pinned.push(ids.remove(i));
+        }
+    }
+    pinned.extend(ids);
+    pinned
+}
+
 /// How long a fetched model list stays fresh before `lulz` re-reads
 /// `/v1/models`. The roster changes when OpenCode adds a model, not by the
 /// minute, so half a day keeps launches instant without going stale.
@@ -1390,7 +1438,10 @@ fn cmd_doctor() -> Result<(), String> {
             paint("note", "33"),
         );
     }
-    if auth_failures > 0 {
+    if auth_failures > 0 && !(claude_answered || codex_answered) {
+        // Nothing got through at all: the key itself is suspect, not the
+        // models. When the gateway was serving others, per-model 401/403s
+        // are just routes that won't take this key, and stay uncached.
         println!(
             "  {} the gateway rejected the key on {auth_failures} probe(s). If that persists,\n  re-run `opencode auth login`, then `lulz auth --save`.",
             paint("auth", "31"),
@@ -1412,6 +1463,12 @@ fn post_status(url: &str, headers: &[&str], body: &str) -> u32 {
         "90",
     ]);
     c.args(headers);
+    // Sessionless traffic is rejected outright, which would otherwise read
+    // as every model losing its capability. Probe as a conversation.
+    c.args([
+        "-H",
+        &format!("x-opencode-session: {}", proxy::session_id()),
+    ]);
     c.args(["-H", "content-type: application/json", "-d", body, url]);
     c.output()
         .ok()
@@ -1557,6 +1614,25 @@ fn read_config() -> BTreeMap<String, String> {
     m
 }
 
+fn write_config(cfg: &BTreeMap<String, String>) -> Result<(), String> {
+    let p = config_path();
+    fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
+    let body: String = cfg.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+    fs::write(&p, body).map_err(|e| e.to_string())
+}
+
+/// Remember one model for every harness without a per-harness default.
+/// Stored as `default=<model>` alongside the `harness=model` lines, so
+/// `lulz default` lists it and per-harness entries keep overriding it.
+fn set_global_default(raw: &str) -> Result<(), String> {
+    let mut cfg = read_config();
+    let model = resolve_alias(raw);
+    cfg.insert("default".to_string(), model.clone());
+    write_config(&cfg)?;
+    println!("default → {model}");
+    Ok(())
+}
+
 fn cmd_default(args: &[String]) -> Result<(), String> {
     let cfg = read_config();
     if args.is_empty() {
@@ -1573,10 +1649,7 @@ fn cmd_default(args: &[String]) -> Result<(), String> {
     let mut cfg = cfg;
     cfg.insert(harness.clone(), resolve_alias(model));
 
-    let p = config_path();
-    fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
-    let body: String = cfg.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
-    fs::write(&p, body).map_err(|e| e.to_string())?;
+    write_config(&cfg)?;
     println!("{harness} → {}", cfg[harness]);
     Ok(())
 }
@@ -1602,6 +1675,8 @@ fn curl(url: &str, key: &str) -> Result<String, String> {
             "20",
             "-H",
             &format!("Authorization: Bearer {key}"),
+            "-H",
+            &format!("x-opencode-session: {}", proxy::session_id()),
             url,
         ])
         .output()
@@ -1721,11 +1796,13 @@ mod tests {
 
     /// The bug this table shipped with: the default model was marked
     /// claude-capable on a guess, and every `lulz launch claude` walked into a
-    /// route the gateway will not serve. A default must be a verified one.
+    /// route the gateway will not serve. A default must be a verified one —
+    /// natively, or over the bridge (which needs the model's /responses
+    /// route, i.e. codex-capability, to translate Claude through).
     #[test]
     fn the_defaults_can_drive_the_harness_they_default_for() {
-        assert!(caps(DEFAULT_CLAUDE_MODEL).is_some_and(|c| c.claude));
-        assert!(caps(DEFAULT_CODEX_MODEL).is_some_and(|c| c.codex));
+        assert!(caps(DEFAULT_CLAUDE_MODEL).is_some_and(|c| c.claude || c.codex));
+        assert!(caps(DEFAULT_CODEX_MODEL).is_some());
         // Claude Code drives the small model over Messages too.
         assert!(caps(DEFAULT_SMALL_MODEL).is_some_and(|c| c.claude));
     }
@@ -1841,6 +1918,7 @@ mod tests {
     #[test]
     fn aliases_expand() {
         assert_eq!(resolve_alias("qwen"), "qwen3.8-max");
+        assert_eq!(resolve_alias("muse"), "muse-spark-1.3-contributor");
         assert_eq!(resolve_alias("glm-5.1"), "glm-5.1");
     }
 
@@ -1857,6 +1935,17 @@ mod tests {
             ids(&["big-pickle", "glm-5.3"]),
         );
         assert_eq!(merged, ids(&["big-pickle", "mimo-v2.5-free", "glm-5.3"]));
+    }
+
+    #[test]
+    fn models_list_leads_with_the_default() {
+        let listed = pin_defaults(ids(&["glm-5.3", "muse-spark-1.3-contributor", "kimi-k3"]));
+        assert_eq!(
+            listed,
+            ids(&["muse-spark-1.3-contributor", "glm-5.3", "kimi-k3"])
+        );
+        // A default the gateway doesn't serve changes nothing.
+        assert_eq!(pin_defaults(ids(&["glm-5.3"])), ids(&["glm-5.3"]));
     }
 
     #[test]

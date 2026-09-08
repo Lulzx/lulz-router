@@ -13,7 +13,9 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
 
@@ -31,7 +33,7 @@ fn debug(tag: &str, body: &str) {
     }
 }
 
-fn upstream_curl(url: String, key: &str) -> Command {
+fn upstream_curl(url: String, key: &str, session: &str) -> Command {
     let mut command = Command::new("curl");
     command.args(["-sS", "-N", "--max-time", "1800", "-X", "POST"]);
     if !key.is_empty() {
@@ -40,15 +42,51 @@ fn upstream_curl(url: String, key: &str) -> Command {
             .args(["--expand-header", "Authorization: Bearer {{LULZ_KEY}}"])
             .env("LULZ_KEY", key);
     }
+    // The gateway routes and caches by conversation: sessionless traffic is
+    // rejected, so every upstream request carries a stable id for this
+    // launch (or the harness's own, when it sent one).
+    if !session.is_empty() {
+        command.args(["-H", &format!("x-opencode-session: {session}")]);
+    }
     command
         .args(["-H", "content-type: application/json", "-d", "@-"])
         .arg(url);
     command
 }
 
+static SESSION: OnceLock<String> = OnceLock::new();
+
+/// One stable conversation id per lulz process, for the gateway's session
+/// routing. Generated, not configured: it only needs to be stable within
+/// the launch, and uuid-worthy uniqueness is overkill next to pid+time.
+pub fn session_id() -> String {
+    SESSION
+        .get_or_init(|| {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!("lulz-{}-{nanos}", std::process::id())
+        })
+        .clone()
+}
+
+/// The harness's own `x-opencode-session` when it sent one, else ours.
+/// Either way the upstream sees a stable conversation id — this is the
+/// "preserve the session header when forwarding" the Go docs ask for.
+fn request_session(headers: &[(String, String)], fallback: &str) -> String {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-opencode-session"))
+        .map(|(_, value)| value.clone())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 pub struct Upstream {
     pub base: String,
     pub key: String,
+    pub session: String,
 }
 
 /// A Responses-only provider model exposed as an Anthropic Messages endpoint.
@@ -56,6 +94,7 @@ pub struct ResponsesUpstream {
     pub base: String,
     pub key: String,
     pub model: String,
+    pub session: String,
 }
 
 /// Bind an ephemeral Messages endpoint for Claude Code. The selected provider
@@ -70,6 +109,7 @@ pub fn spawn_anthropic(up: ResponsesUpstream) -> std::io::Result<u16> {
                 base: up.base.clone(),
                 key: up.key.clone(),
                 model: up.model.clone(),
+                session: up.session.clone(),
             };
             thread::spawn(move || {
                 let _ = serve_anthropic(conn, &up);
@@ -80,7 +120,7 @@ pub fn spawn_anthropic(up: ResponsesUpstream) -> std::io::Result<u16> {
 }
 
 fn serve_anthropic(mut sock: TcpStream, up: &ResponsesUpstream) -> std::io::Result<()> {
-    let (path, body) = match read_request(&mut sock)? {
+    let (path, headers, body) = match read_request(&mut sock)? {
         Some(r) => r,
         None => return Ok(()),
     };
@@ -122,7 +162,11 @@ fn serve_anthropic(mut sock: TcpStream, up: &ResponsesUpstream) -> std::io::Resu
     debug("messages-in", &req.to_string());
     debug("responses-out", &responses.to_string());
 
-    let mut child = upstream_curl(format!("{}/responses", up.base), &up.key)
+    let mut child = upstream_curl(
+        format!("{}/responses", up.base),
+        &up.key,
+        &request_session(&headers, &up.session),
+    )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -193,6 +237,7 @@ pub fn spawn(up: Upstream) -> std::io::Result<u16> {
             let up = Upstream {
                 base: up.base.clone(),
                 key: up.key.clone(),
+                session: up.session.clone(),
             };
             thread::spawn(move || {
                 let _ = serve(conn, &up);
@@ -203,7 +248,7 @@ pub fn spawn(up: Upstream) -> std::io::Result<u16> {
 }
 
 fn serve(mut sock: TcpStream, up: &Upstream) -> std::io::Result<()> {
-    let (path, body) = match read_request(&mut sock)? {
+    let (path, headers, body) = match read_request(&mut sock)? {
         Some(r) => r,
         None => return Ok(()),
     };
@@ -236,7 +281,11 @@ fn serve(mut sock: TcpStream, up: &Upstream) -> std::io::Result<()> {
     // Upstream over curl: no TLS stack to vendor, and `-N` keeps the SSE live.
     // The key travels in the environment and is expanded by curl itself:
     // spelling it in argv would publish it to every `ps` on the machine.
-    let mut child = upstream_curl(format!("{}/chat/completions", up.base), &up.key)
+    let mut child = upstream_curl(
+        format!("{}/chat/completions", up.base),
+        &up.key,
+        &request_session(&headers, &up.session),
+    )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -362,7 +411,9 @@ fn write_head(
     sock.flush()
 }
 
-fn read_request(sock: &mut TcpStream) -> std::io::Result<Option<(String, Vec<u8>)>> {
+fn read_request(
+    sock: &mut TcpStream,
+) -> std::io::Result<Option<(String, Vec<(String, String)>, Vec<u8>)>> {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
@@ -375,21 +426,28 @@ fn read_request(sock: &mut TcpStream) -> std::io::Result<Option<(String, Vec<u8>
         }
     }
     let head = String::from_utf8_lossy(&head).to_string();
-    let path = head
-        .lines()
+    let mut lines = head.lines();
+    let path = lines
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
         .unwrap_or("/")
         .to_string();
-    let len = head
-        .lines()
-        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
-        .and_then(|l| l.split(':').nth(1))
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(0);
+    let mut headers = Vec::new();
+    let mut len = 0usize;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                len = value.trim().parse().unwrap_or(0);
+            }
+            headers.push((name.trim().to_string(), value.trim().to_string()));
+        }
+    }
     let mut body = vec![0u8; len];
     sock.read_exact(&mut body)?;
-    Ok(Some((path, body)))
+    Ok(Some((path, headers, body)))
 }
 
 // ------------------------------------------------- Responses -> Chat ------
@@ -1631,6 +1689,26 @@ mod tests {
         assert!(peek_stream(&mut r, &mut skipped).unwrap().is_none());
     }
 
+    #[test]
+    fn session_id_is_stable_within_the_process() {
+        let a = session_id();
+        assert!(!a.is_empty());
+        assert_eq!(a, session_id());
+    }
+
+    #[test]
+    fn upstream_keeps_the_harness_session_when_it_sent_one() {
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            ("X-OpenCode-Session".to_string(), "codex-conv-1".to_string()),
+        ];
+        assert_eq!(request_session(&headers, "lulz-fallback"), "codex-conv-1");
+        // ... else ours, so the gateway never sees a sessionless request.
+        let bare: Vec<(String, String)> = vec![];
+        assert_eq!(request_session(&bare, "lulz-fallback"), "lulz-fallback");
+        let empty = vec![("x-opencode-session".to_string(), String::new())];
+        assert_eq!(request_session(&empty, "lulz-fallback"), "lulz-fallback");
+    }
     #[test]
     fn upstream_error_becomes_response_failed() {
         let events = drain(&[
