@@ -162,6 +162,7 @@ const ALIASES: &[(&str, &str)] = &[
 const HARNESSES: &[(&str, &str)] = &[
     ("claude", "Claude Code  (Anthropic Messages)"),
     ("codex", "Codex CLI     (Responses / Chat Completions)"),
+    ("codex-app", "Codex Desktop (Responses / Chat Completions)"),
     ("opencode", "OpenCode      (native)"),
 ];
 
@@ -250,6 +251,7 @@ run any coding-agent harness on your OpenCode Go subscription
 {harnesses}
   claude      Claude Code       (Anthropic Messages)
   codex       Codex CLI         (Responses / Chat Completions)
+  codex-app   Codex Desktop app (Responses / Chat Completions)
   opencode    OpenCode          (native)
 
 {examples}
@@ -257,6 +259,7 @@ run any coding-agent harness on your OpenCode Go subscription
   lulz launch                          # same as bare lulz
   lulz launch claude                    # live searchable model picker
   lulz launch codex                     # same picker, then Codex
+  lulz launch codex-app                 # same picker, then the Codex desktop app
   lulz launch claude -m minimax-m3
   lulz launch codex -m gpt-5.6-luna
   lulz launch codex -m qwen3.8-max     # bridged automatically
@@ -430,7 +433,7 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
         if opts.translate || can_run(&harness, model) {
             return Ok(());
         }
-        let alt = if harness == "codex" {
+        let alt = if wire_harness(&harness) == "codex" {
             "claude"
         } else {
             "codex"
@@ -449,7 +452,7 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
                 "\n  or keep the model: lulz launch {alt} -m {model}"
             ));
         }
-        if harness == "codex" {
+        if wire_harness(&harness) == "codex" {
             msg.push_str("\n  or drop --no-translate and let lulz bridge it");
         }
         Err(msg)
@@ -459,6 +462,10 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
     // A bridge or the schema guard runs inside this process, and exec() would
     // wipe its threads out, so those launches hand the terminal to a child.
     let mut local_proxy = false;
+    // `codex app` hands off to the desktop app and returns; the proxy lives in
+    // this process, so lulz has to outlive the launch command rather than
+    // pulling the backend out from under the window it just opened.
+    let mut hold_open = false;
     let (bin, model, provider, argv, env): LaunchPlan = match harness.as_str() {
         "claude" => {
             let model = pick(DEFAULT_CLAUDE_MODEL)?;
@@ -552,7 +559,7 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
                 env,
             )
         }
-        "codex" => {
+        "codex" | "codex-app" => {
             let model = pick(DEFAULT_CODEX_MODEL)?;
             let zen = is_zen(&model);
             let key = if zen { &zen_key } else { &go_key };
@@ -620,6 +627,12 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
                 "-c".into(),
                 format!("model=\"{model}\""),
             ];
+            if harness == "codex-app" {
+                // `codex app [OPTIONS] [PATH]` takes the same -c overrides,
+                // so only the subcommand has to lead.
+                argv.insert(0, "app".into());
+                hold_open = true;
+            }
             argv.extend(opts.rest.clone());
             let env = vec![("OPENCODE_API_KEY".into(), key.clone())];
             (
@@ -658,7 +671,7 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
         }
         other => {
             return Err(format!(
-                "unknown harness `{other}` — expected claude, codex or opencode"
+                "unknown harness `{other}` — expected claude, codex, codex-app or opencode"
             ))
         }
     };
@@ -690,6 +703,18 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
         let status = cmd
             .status()
             .map_err(|e| format!("failed to run {}: {e}", path.display()))?;
+        if hold_open && status.success() {
+            // The desktop app is a separate process that keeps talking to our
+            // proxy after `codex app` returns. Park here until interrupted.
+            eprintln!(
+                "  {} the Codex desktop app is running against this session.",
+                paint("open", "35;1")
+            );
+            eprintln!("  {}\n", paint("leave this running; ctrl-c closes the route", "2"));
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            }
+        }
         std::process::exit(status.code().unwrap_or(1));
     }
     Err(format!("failed to exec {}: {}", path.display(), cmd.exec()))
@@ -702,6 +727,7 @@ fn banner(harness: &str, model: &str, provider: &str, translate: bool) {
     let label = match harness {
         "claude" => "Claude Code",
         "codex" => "Codex",
+        "codex-app" => "Codex Desktop",
         _ => "OpenCode",
     };
     eprintln!();
@@ -716,7 +742,7 @@ fn banner(harness: &str, model: &str, provider: &str, translate: bool) {
             "responses -> chat completions"
         };
         eprintln!("  {} {direction}", paint("bridge", "2"));
-    } else if harness == "codex" {
+    } else if harness.starts_with("codex") {
         eprintln!("  {} responses -> responses", paint("guard", "2"));
     }
     eprintln!();
@@ -811,7 +837,18 @@ fn caps(model: &str) -> Option<&'static Caps> {
 
 /// Baseline table, overlaid with whatever `lulz doctor` last measured.
 /// Unknown models are assumed capable — the harness reports the truth.
+/// Both Codex front-ends speak the same wire, so capability lookups keyed by
+/// harness must see them as one.
+fn wire_harness(harness: &str) -> &str {
+    if harness == "codex-app" {
+        "codex"
+    } else {
+        harness
+    }
+}
+
 fn can_run(harness: &str, model: &str) -> bool {
+    let harness = wire_harness(harness);
     if let Some(v) = probe_cache().get(&format!("{harness}:{model}")) {
         return v == "ok";
     }
@@ -831,6 +868,7 @@ fn best_for(harness: &str) -> Vec<String> {
 }
 
 fn best_among(harness: &str, ids: &[String]) -> Vec<String> {
+    let harness = wire_harness(harness);
     ids.iter()
         .filter(|id| can_run(harness, id))
         .cloned()
@@ -1050,7 +1088,7 @@ fn render_harness_picker(tty: &mut fs::File, selected: usize) -> Result<(), Stri
     write!(
         tty,
         "\r\n  {}\r\n",
-        paint("↑↓ move · 1-3 shortcut · enter select · ctrl-c cancel", "2")
+        paint("↑↓ move · 1-9 shortcut · enter select · ctrl-c cancel", "2")
     )
     .map_err(|e| e.to_string())?;
     tty.flush().map_err(|e| e.to_string())
@@ -1939,7 +1977,7 @@ mod tests {
     #[test]
     fn harness_picker_lists_every_supported_harness() {
         let ids: Vec<&str> = HARNESSES.iter().map(|(id, _)| *id).collect();
-        assert_eq!(ids, vec!["claude", "codex", "opencode"]);
+        assert_eq!(ids, vec!["claude", "codex", "codex-app", "opencode"]);
     }
 
     #[test]

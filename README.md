@@ -6,8 +6,8 @@ Run your coding-agent harness on your OpenCode Go subscription — plus OpenCode
             Claude Code
            ╱
 Codex ─── lulz ─── OpenCode Go (+ Zen free)
-           ╲
-            OpenCode
+  (CLI    ╲
+   or app) OpenCode
 ```
 
 You keep the harness — TUI, tools, skills, MCP, sandbox. Only inference changes.
@@ -21,6 +21,7 @@ lulz launch claude                  # live picker: [Zen] free models first, then
 lulz                               # pick a harness first, then pick a model
 lulz launch claude -m minimax-m3
 lulz launch codex -m gpt-5.6-luna
+lulz launch codex-app               # the Codex desktop app, same route
 lulz launch claude -- --resume      # everything after -- goes to the harness
 ```
 

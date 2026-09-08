@@ -24,4 +24,6 @@ codex -c model_provider="opencodego" \
       -c model="gpt-5.6-luna"
 ```
 
+**Codex Desktop** (`codex-app`) is the same provider injection with the `app` subcommand in front — `codex app` takes the same `-c` overrides. It hands off to the desktop process and exits, so `lulz` parks in the foreground instead of tearing down the endpoint the window is still using.
+
 Codex's own metadata does not know these slugs, so it prints `Model metadata for <id> not found` and runs on fallback metadata (a 272k context window). That catalog is Codex's, not something lulz can inject: `model_catalog_json` replaces Codex's catalog rather than extending it, and any entry added to it also defers every MCP tool behind Codex's `tool_search` — a worse trade than the warning.
