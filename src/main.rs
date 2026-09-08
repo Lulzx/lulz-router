@@ -153,10 +153,30 @@ const ALIASES: &[(&str, &str)] = &[
     ("hy", "hy3"),
 ];
 
+const HARNESSES: &[(&str, &str)] = &[
+    ("claude", "Claude Code  (Anthropic Messages)"),
+    ("codex", "Codex CLI     (Responses / Chat Completions)"),
+    ("opencode", "OpenCode      (native)"),
+];
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
-        if let Err(e) = cmd_launch(&["claude".to_string()]) {
+        // Bare `lulz` is a harness choice followed by a model choice.
+        // Non-interactive stdin (scripts, pipes) keeps the old default so
+        // nothing ever blocks waiting for a keypress it cannot receive.
+        let first = if std::io::stdin().is_terminal() {
+            match select_harness() {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("{} {e}", paint("error", "31;1"));
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            "claude".to_string()
+        };
+        if let Err(e) = cmd_launch(&[first]) {
             eprintln!("{} {e}", paint("error", "31;1"));
             std::process::exit(1);
         }
@@ -194,8 +214,8 @@ fn help() {
 run any coding-agent harness on your OpenCode Go subscription
 
 {usage}
-  lulz                              # same as: lulz launch claude
-  lulz launch <harness> [-m <model>] [-- <harness args>...]
+  lulz                              # pick a harness, then pick a model
+  lulz launch [<harness>] [-m <model>] [-- <harness args>...]
   lulz models [--refresh]
   lulz auth [--save]
   lulz doctor
@@ -207,7 +227,10 @@ run any coding-agent harness on your OpenCode Go subscription
   opencode    OpenCode          (native)
 
 {examples}
+  lulz                                 # harness picker, then model picker
+  lulz launch                          # same as bare lulz
   lulz launch claude                    # live searchable model picker
+  lulz launch codex                     # same picker, then Codex
   lulz launch claude -m minimax-m3
   lulz launch codex -m gpt-5.6-luna
   lulz launch codex -m qwen3.8-max     # bridged automatically
@@ -223,7 +246,7 @@ run any coding-agent harness on your OpenCode Go subscription
       --print         print the resolved command and env, then exit
   -r, --refresh       (models) re-read /v1/models instead of the 12h cache
 
-Bare interactive Claude launches always refresh /v1/models and open the picker.
+Bare interactive launches always refresh /v1/models and open the picker.
 Type to fuzzy-filter, use arrows to move, and press enter to select.
 The current OpenCode Zen free models appear first and are labelled `[Zen]`;
 paid Zen models are never included. OpenCode Go models follow them, labelled `[Go]`.
@@ -295,27 +318,50 @@ fn parse_launch(args: &[String]) -> Result<(String, LaunchOpts), String> {
 }
 
 fn cmd_launch(args: &[String]) -> Result<(), String> {
+    // `lulz launch` with no harness — or flags where the harness goes — is
+    // the same choice bare `lulz` offers. Scripts (no tty) keep `claude`;
+    // a bare non-interactive `lulz launch` stays an error rather than
+    // guessing.
+    let owned;
+    let args: &[String] = if args.is_empty() || args[0].starts_with('-') {
+        let harness = if std::io::stdin().is_terminal() {
+            select_harness()?
+        } else if args.is_empty() {
+            return Err("which harness? try `lulz launch claude`".into());
+        } else {
+            "claude".to_string()
+        };
+        let mut v = vec![harness];
+        v.extend_from_slice(args);
+        owned = v;
+        &owned
+    } else {
+        args
+    };
     let (harness, opts) = parse_launch(args)?;
-    let go_key = find_key().ok().map(|key| key.value).unwrap_or_default();
-    let zen_key = find_zen_key()
-        .map(|key| key.value)
+    let go_key_res = find_key();
+    let go_key_err = go_key_res.as_ref().err().cloned();
+    let go_key = go_key_res.map(|key| key.value).unwrap_or_default();
+    let zen_found = find_zen_key();
+    let zen_key = zen_found
+        .as_ref()
+        .map(|key| key.value.clone())
         .unwrap_or_else(|| go_key.clone());
     let cfg = read_config();
 
     // A bare interactive launch is a model choice, not a silently changing
     // compiled-in default. Force a live roster fetch every time the picker is
     // shown so newly-added OpenCode Go models are immediately available.
-    let interactive_pick =
-        harness == "claude" && opts.model.is_none() && std::io::stdin().is_terminal();
+    let interactive_pick = opts.model.is_none() && std::io::stdin().is_terminal();
 
     // What the gateway actually serves, so a model it has never heard of is a
     // sentence from lulz rather than an opaque API error from the harness.
     let zen_served = zen_free_roster();
-    let mut served = zen_served.clone();
-    if !go_key.is_empty() {
-        served.extend(roster(&go_key, interactive_pick));
-    }
-    served.dedup();
+    let served = if go_key.is_empty() {
+        zen_served.clone()
+    } else {
+        merge_served(zen_served.clone(), roster(&go_key, interactive_pick))
+    };
     let is_zen = |model: &str| zen_served.iter().any(|id| id == model);
     let pick = |dflt: &str| -> Result<String, String> {
         let configured = cfg
@@ -332,7 +378,22 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
         } else {
             configured
         };
-        ensure_served(resolve_alias(&raw), &served)
+        let model = ensure_served(resolve_alias(&raw), &served)?;
+        // The Zen endpoint rejects the Go key (`free tier can only be used in
+        // OpenCode`), so a Zen pick without a Zen key would only die inside
+        // the harness. Say so before anything starts. Same for a Go model
+        // with no Go key at all.
+        if is_zen(&model) && zen_found.is_none() {
+            return Err(format!(
+                "`{model}` is an OpenCode Zen free model but no Zen key was found.\n  run `opencode auth login`, or set OPENCODE_ZEN_API_KEY,\n  or use a Go model instead (see `lulz models`)"
+            ));
+        }
+        if !is_zen(&model) && go_key.is_empty() {
+            return Err(go_key_err.clone().unwrap_or_else(|| {
+                "no OpenCode Go key found.\n  run `opencode auth login`, or set OPENCODE_API_KEY".into()
+            }));
+        }
+        Ok(model)
     };
 
     let gate = |model: &str| -> Result<(), String> {
@@ -916,6 +977,89 @@ fn select_model(ids: &[String], preferred: &str) -> Result<String, String> {
     }
 }
 
+fn render_harness_picker(tty: &mut fs::File, selected: usize) -> Result<(), String> {
+    write!(
+        tty,
+        "\x1b[u\x1b[J  {} {}\r\n\r\n",
+        paint("harness", "1"),
+        paint("(pick one)", "2"),
+    )
+    .map_err(|e| e.to_string())?;
+    for (index, (id, desc)) in HARNESSES.iter().enumerate() {
+        let cursor = if index == selected {
+            paint(">", "35;1")
+        } else {
+            " ".into()
+        };
+        let row = format!("{id:<10} {desc}");
+        let label = if index == selected {
+            paint(&row, "1")
+        } else {
+            row
+        };
+        write!(tty, "  {cursor} {label}\r\n").map_err(|e| e.to_string())?;
+    }
+    write!(
+        tty,
+        "\r\n  {}\r\n",
+        paint("↑↓ move · 1-3 shortcut · enter select · ctrl-c cancel", "2")
+    )
+    .map_err(|e| e.to_string())?;
+    tty.flush().map_err(|e| e.to_string())
+}
+
+/// Harness first, model second: what bare `lulz` asks before the model picker.
+fn select_harness() -> Result<String, String> {
+    let _raw = RawTerminal::enter()?;
+    let mut tty = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|e| format!("terminal: {e}"))?;
+    let mut selected = 0usize;
+    write!(tty, "\x1b[s").map_err(|e| e.to_string())?;
+    loop {
+        render_harness_picker(&mut tty, selected)?;
+        let mut byte = [0u8; 1];
+        tty.read_exact(&mut byte)
+            .map_err(|e| format!("terminal input: {e}"))?;
+        match byte[0] {
+            b'\r' | b'\n' => {
+                let h = HARNESSES[selected].0.to_string();
+                write!(tty, "\x1b[u\x1b[J").map_err(|e| e.to_string())?;
+                return Ok(h);
+            }
+            3 => {
+                write!(tty, "\x1b[u\x1b[J").map_err(|e| e.to_string())?;
+                return Err("harness selection cancelled".into());
+            }
+            b'1'..=b'9' => {
+                let i = (byte[0] - b'1') as usize;
+                if i < HARNESSES.len() {
+                    let h = HARNESSES[i].0.to_string();
+                    write!(tty, "\x1b[u\x1b[J").map_err(|e| e.to_string())?;
+                    return Ok(h);
+                }
+            }
+            27 => {
+                let mut seq = [0u8; 2];
+                tty.read_exact(&mut seq)
+                    .map_err(|e| format!("terminal input: {e}"))?;
+                match seq {
+                    [b'[', b'A'] => {
+                        selected = selected.checked_sub(1).unwrap_or(HARNESSES.len() - 1);
+                    }
+                    [b'[', b'B'] => {
+                        selected = (selected + 1) % HARNESSES.len();
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 // ---------------------------------------------------------------- roster ---
 
 fn zen_wire(model: &str) -> Option<ZenWire> {
@@ -954,6 +1098,18 @@ fn filter_zen_free(live: &[String]) -> Vec<String> {
         .filter(|entry| live.iter().any(|id| id == entry.id))
         .map(|entry| entry.id.to_string())
         .collect()
+}
+
+/// Zen rows first, then Go; an id served by both keeps its Zen row only, so
+/// the picker never offers the same model twice. (A plain `dedup` would only
+/// catch adjacent pairs, and these lists arrive in different orders.)
+fn merge_served(mut zen: Vec<String>, go: Vec<String>) -> Vec<String> {
+    for id in go {
+        if !zen.contains(&id) {
+            zen.push(id);
+        }
+    }
+    zen
 }
 
 /// How long a fetched model list stays fresh before `lulz` re-reads
@@ -1686,6 +1842,35 @@ mod tests {
     fn aliases_expand() {
         assert_eq!(resolve_alias("qwen"), "qwen3.8-max");
         assert_eq!(resolve_alias("glm-5.1"), "glm-5.1");
+    }
+
+    #[test]
+    fn harness_picker_lists_every_supported_harness() {
+        let ids: Vec<&str> = HARNESSES.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec!["claude", "codex", "opencode"]);
+    }
+
+    #[test]
+    fn served_roster_keeps_zen_first_without_duplicates() {
+        let merged = merge_served(
+            ids(&["big-pickle", "mimo-v2.5-free"]),
+            ids(&["big-pickle", "glm-5.3"]),
+        );
+        assert_eq!(merged, ids(&["big-pickle", "mimo-v2.5-free", "glm-5.3"]));
+    }
+
+    #[test]
+    fn flags_first_launch_still_parses_once_harness_is_prepended() {
+        // What `lulz launch -m qwen -- --resume` becomes after the harness
+        // is resolved (picked interactively, `claude` otherwise).
+        let a: Vec<String> = ["claude", "-m", "qwen", "--", "--resume"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (h, o) = parse_launch(&a).unwrap();
+        assert_eq!(h, "claude");
+        assert_eq!(o.model.unwrap(), "qwen");
+        assert_eq!(o.rest, vec!["--resume"]);
     }
 
     #[test]

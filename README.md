@@ -18,6 +18,7 @@ You keep the harness — TUI, tools, skills, MCP, sandbox. Only inference change
 curl -fsSL https://raw.githubusercontent.com/Lulzx/lulz-router/main/install.sh | sh
 
 lulz launch claude                  # live picker: [Zen] free models first, then [Go]
+lulz                               # pick a harness first, then pick a model
 lulz launch claude -m minimax-m3
 lulz launch codex -m gpt-5.6-luna
 lulz launch claude -- --resume      # everything after -- goes to the harness
