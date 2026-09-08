@@ -33,9 +33,13 @@ fn debug(tag: &str, body: &str) {
     }
 }
 
-fn upstream_curl(url: String, key: &str, session: &str) -> Command {
+fn upstream_curl(url: String, key: &str, session: &str, dump_headers: bool) -> Command {
     let mut command = Command::new("curl");
     command.args(["-sS", "-N", "--max-time", "1800", "-X", "POST"]);
+    if dump_headers {
+        // The schema guard relays the upstream status and content type as-is.
+        command.arg("-i");
+    }
     if !key.is_empty() {
         command
             .args(["--variable", "%LULZ_KEY"])
@@ -166,6 +170,7 @@ fn serve_anthropic(mut sock: TcpStream, up: &ResponsesUpstream) -> std::io::Resu
         format!("{}/responses", up.base),
         &up.key,
         &request_session(&headers, &up.session),
+        false,
     )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -285,6 +290,7 @@ fn serve(mut sock: TcpStream, up: &Upstream) -> std::io::Result<()> {
         format!("{}/chat/completions", up.base),
         &up.key,
         &request_session(&headers, &up.session),
+        false,
     )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -390,12 +396,7 @@ fn write_head(
     ctype: &str,
     body: Option<&[u8]>,
 ) -> std::io::Result<()> {
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        _ => "Bad Gateway",
-    };
+    let reason = status_reason(status);
     let mut head = format!("HTTP/1.1 {status} {reason}\r\ncontent-type: {ctype}\r\n");
     match body {
         Some(b) => head.push_str(&format!(
@@ -409,6 +410,32 @@ fn write_head(
         sock.write_all(b)?;
     }
     sock.flush()
+}
+
+/// Stream head with no content-length: the guard relays an upstream body of
+/// unknown length and lets the connection close end it.
+fn write_status_head(sock: &mut TcpStream, status: u16, ctype: &str) -> std::io::Result<()> {
+    let reason = status_reason(status);
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: {ctype}\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n"
+    );
+    sock.write_all(head.as_bytes())?;
+    sock.flush()
+}
+
+fn status_reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "Bad Gateway",
+    }
 }
 
 fn read_request(
@@ -513,7 +540,9 @@ pub fn to_chat(req: &Value) -> Value {
             body.insert(k.into(), v.clone());
         }
     }
-    Value::Object(body)
+    let mut out = Value::Object(body);
+    sanitize_tool_schemas(&mut out);
+    out
 }
 
 fn push_input_item(item: &Value, messages: &mut Vec<Value>) {
@@ -644,6 +673,226 @@ fn to_chat_tool_choice(tc: &Value) -> Value {
     }
 }
 
+// ------------------------------------------------------- schema guard -----
+
+/// Providers behind the gateway reject self-referential JSON Schema outright
+/// ("Recursive JSON schemas are not currently supported"), and MCP servers and
+/// plugin tools ship $ref cycles routinely. Flatten every tool schema in a
+/// request: non-recursive refs are inlined, a ref that leads back into itself
+/// becomes a permissive empty schema so the model can still call the tool.
+pub fn sanitize_tool_schemas(body: &mut Value) {
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools.iter_mut() {
+            sanitize_tool(tool);
+        }
+    }
+    // Codex's "responses lite" shape carries the tool list inside the input.
+    if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
+        for item in input.iter_mut() {
+            if let Some(tools) = item.get_mut("tools").and_then(Value::as_array_mut) {
+                for tool in tools.iter_mut() {
+                    sanitize_tool(tool);
+                }
+            }
+        }
+    }
+}
+
+fn sanitize_tool(tool: &mut Value) {
+    // Codex nests plugin and MCP tools one level down, under a namespace.
+    if let Some(nested) = tool.get_mut("tools").and_then(Value::as_array_mut) {
+        for inner in nested.iter_mut() {
+            sanitize_tool(inner);
+        }
+    }
+    for key in ["parameters", "input_schema"] {
+        if let Some(schema) = tool.get_mut(key) {
+            let flat = flatten_schema(schema);
+            *schema = flat;
+        }
+    }
+    // Chat Completions nests the same schema one level deeper.
+    if let Some(function) = tool.get_mut("function") {
+        if let Some(schema) = function.get_mut("parameters") {
+            let flat = flatten_schema(schema);
+            *schema = flat;
+        }
+    }
+}
+
+/// Node depth beyond which a schema is cut short. Real tool schemas sit around
+/// 10; the cap only exists so a pathological one cannot expand for ever.
+const MAX_SCHEMA_DEPTH: usize = 32;
+
+fn flatten_schema(schema: &Value) -> Value {
+    let mut stack = Vec::new();
+    flatten(schema, schema, &mut stack, 0)
+}
+
+/// The stack holds the pointers currently being inlined, which is exactly what
+/// makes a cycle (node -> children -> node) detectable.
+fn flatten(root: &Value, node: &Value, stack: &mut Vec<String>, depth: usize) -> Value {
+    if depth > MAX_SCHEMA_DEPTH {
+        return json!({});
+    }
+    match node {
+        Value::Object(map) => {
+            if let Some(Value::String(pointer)) = map.get("$ref") {
+                if stack.iter().any(|seen| seen == pointer) {
+                    return json!({});
+                }
+                let Some(target) = resolve_pointer(root, pointer) else {
+                    return json!({});
+                };
+                stack.push(pointer.clone());
+                let inlined = flatten(root, target, stack, depth + 1);
+                stack.pop();
+                return inlined;
+            }
+            let mut out = Map::new();
+            for (key, value) in map {
+                // The definitions existed only for the refs just inlined.
+                if key == "$defs" || key == "definitions" {
+                    continue;
+                }
+                out.insert(key.clone(), flatten(root, value, stack, depth + 1));
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|i| flatten(root, i, stack, depth + 1)).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Local JSON-pointer lookup ("#/$defs/name"). Remote refs are not followed.
+fn resolve_pointer<'a>(root: &'a Value, pointer: &str) -> Option<&'a Value> {
+    let rest = pointer.strip_prefix('#')?;
+    let mut node = root;
+    for token in rest.strip_prefix('/').unwrap_or(rest).split('/') {
+        if token.is_empty() {
+            continue;
+        }
+        let token = token.replace("~1", "/").replace("~0", "~");
+        node = match node {
+            Value::Object(map) => map.get(&token)?,
+            Value::Array(items) => items.get(token.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(node)
+}
+
+/// Native Codex traffic runs through this loopback pass-through, because a
+/// harness talking to the gateway directly gives lulz no chance to touch its
+/// tool schemas. The wire protocol is untouched: the request body is only
+/// rewritten when it carries tools, and the upstream response is relayed byte
+/// for byte, status and content type included.
+pub struct GuardUpstream {
+    pub base: String,
+    pub key: String,
+    pub session: String,
+}
+
+pub fn spawn_guard(up: GuardUpstream) -> std::io::Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    thread::spawn(move || {
+        for conn in listener.incoming().flatten() {
+            let up = GuardUpstream {
+                base: up.base.clone(),
+                key: up.key.clone(),
+                session: up.session.clone(),
+            };
+            thread::spawn(move || {
+                let _ = serve_guard(conn, &up);
+            });
+        }
+    });
+    Ok(port)
+}
+
+/// Codex asks for /v1/responses whatever the configured base url says, while
+/// the gateway wants that path relative to its own /v1 root.
+fn guard_url(base: &str, path: &str) -> String {
+    let rest = path.strip_prefix("/v1").unwrap_or(path);
+    format!("{}{rest}", base.trim_end_matches('/'))
+}
+
+fn serve_guard(mut sock: TcpStream, up: &GuardUpstream) -> std::io::Result<()> {
+    let (path, headers, body) = match read_request(&mut sock)? {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+    let url = guard_url(&up.base, &path);
+    debug("guard-url", &url);
+
+    let payload = match serde_json::from_slice::<Value>(&body) {
+        Ok(mut req) => {
+            sanitize_tool_schemas(&mut req);
+            debug("guard-out", &req.to_string());
+            req.to_string().into_bytes()
+        }
+        Err(_) => body.clone(),
+    };
+
+    let mut child = upstream_curl(url, &up.key, &request_session(&headers, &up.session), true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child.stdin.take().unwrap().write_all(&payload)?;
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+
+    // -i puts the upstream status line and headers in front of the body, so the
+    // harness sees the gateway's own errors instead of a fake 200 stream.
+    let mut line = String::new();
+    if out.read_line(&mut line)? == 0 {
+        let mut err = String::new();
+        if let Some(mut e) = child.stderr.take() {
+            let _ = e.read_to_string(&mut err);
+        }
+        let _ = child.wait();
+        let body = if err.trim().is_empty() {
+            "upstream sent nothing".to_string()
+        } else {
+            err.trim().to_string()
+        };
+        let payload = json!({"error": {"message": body, "type": "upstream_error"}}).to_string();
+        return write_head(&mut sock, 502, "application/json", Some(payload.as_bytes()));
+    }
+    let status = line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(502);
+    let mut ctype = "application/json".to_string();
+    loop {
+        line.clear();
+        if out.read_line(&mut line)? == 0 || line.trim().is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-type") {
+                ctype = value.trim().to_string();
+            }
+        }
+    }
+    write_status_head(&mut sock, status, &ctype)?;
+    let mut buf = [0u8; 8192];
+    loop {
+        let read = out.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        sock.write_all(&buf[..read])?;
+        sock.flush()?;
+    }
+    let _ = child.wait();
+    Ok(())
+}
+
 // ------------------------------------------------ Messages <-> Responses --
 
 fn anthropic_to_responses(req: &Value, model: &str) -> Value {
@@ -756,7 +1005,9 @@ fn anthropic_to_responses(req: &Value, model: &str) -> Value {
             body.insert(key.into(), value.clone());
         }
     }
-    Value::Object(body)
+    let mut out = Value::Object(body);
+    sanitize_tool_schemas(&mut out);
+    out
 }
 
 fn response_message(role: &str, text: &str) -> Value {
@@ -1768,5 +2019,140 @@ mod tests {
             .any(|(name, value)| name == "message_delta"
                 && value["delta"]["stop_reason"] == "tool_use"));
         assert_eq!(turn.response()["content"][0]["input"]["cmd"], "pwd");
+    }
+
+    // ------------------------------------------------------- schema guard --
+
+    fn recursive_parameters() -> Value {
+        json!({
+            "type": "object",
+            "properties": {"root": {"$ref": "#/$defs/node"}},
+            "$defs": {"node": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "children": {"type": "array", "items": {"$ref": "#/$defs/node"}}
+                }
+            }}
+        })
+    }
+
+    fn has_ref(value: &Value) -> bool {
+        match value {
+            Value::Object(map) => {
+                map.contains_key("$ref")
+                    || map.contains_key("$defs")
+                    || map.contains_key("definitions")
+                    || map.values().any(has_ref)
+            }
+            Value::Array(items) => items.iter().any(has_ref),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn recursive_tool_schema_is_flattened() {
+        // Providers behind the gateway 400 the whole turn on a self-referential
+        // schema ("Recursive JSON schemas are not currently supported").
+        let mut body = json!({
+            "model": "muse-spark-1.3-contributor",
+            "tools": [{
+                "type": "function",
+                "name": "walk_tree",
+                "parameters": recursive_parameters()
+            }]
+        });
+        sanitize_tool_schemas(&mut body);
+        let params = &body["tools"][0]["parameters"];
+        assert!(!has_ref(params), "no $ref may survive: {params}");
+        assert_eq!(
+            params["properties"]["root"]["properties"]["name"]["type"],
+            "string"
+        );
+        // The cycle is cut to a permissive schema, not dropped.
+        assert_eq!(
+            params["properties"]["root"]["properties"]["children"]["items"],
+            json!({})
+        );
+    }
+
+    #[test]
+    fn non_recursive_refs_are_inlined() {
+        let mut body = json!({
+            "tools": [{
+                "type": "function",
+                "name": "ping",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"target": {"$ref": "#/$defs/host"}},
+                    "$defs": {"host": {"type": "string", "description": "hostname"}}
+                }
+            }]
+        });
+        sanitize_tool_schemas(&mut body);
+        let target = &body["tools"][0]["parameters"]["properties"]["target"];
+        assert_eq!(target["type"], "string");
+        assert_eq!(target["description"], "hostname");
+        assert!(body["tools"][0]["parameters"].get("$defs").is_none());
+    }
+
+    #[test]
+    fn nested_namespace_tools_are_sanitized() {
+        let mut body = json!({
+            "tools": [{
+                "type": "namespace",
+                "name": "plugins",
+                "tools": [{
+                    "type": "function",
+                    "name": "walk",
+                    "parameters": recursive_parameters()
+                }]
+            }]
+        });
+        sanitize_tool_schemas(&mut body);
+        assert!(!has_ref(&body["tools"][0]["tools"][0]["parameters"]));
+    }
+
+    #[test]
+    fn responses_lite_tools_inside_input_are_sanitized() {
+        let mut body = json!({
+            "input": [{
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{"type": "function", "name": "walk", "parameters": recursive_parameters()}]
+            }]
+        });
+        sanitize_tool_schemas(&mut body);
+        assert!(!has_ref(&body["input"][0]["tools"][0]["parameters"]));
+    }
+
+    #[test]
+    fn the_chat_bridge_flattens_recursive_schemas() {
+        let req = json!({
+            "model": "qwen3.8-max",
+            "input": [],
+            "tools": [{"type": "function", "name": "walk_tree", "parameters": recursive_parameters()}]
+        });
+        let chat = to_chat(&req);
+        assert!(!has_ref(&chat["tools"][0]["function"]["parameters"]));
+    }
+
+    #[test]
+    fn the_anthropic_bridge_flattens_recursive_schemas() {
+        let req = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "walk_tree", "input_schema": recursive_parameters()}]
+        });
+        let out = anthropic_to_responses(&req, "muse-spark-1.3-contributor");
+        assert!(!has_ref(&out["tools"][0]["parameters"]));
+    }
+
+    #[test]
+    fn guard_url_keeps_the_upstream_v1_root() {
+        let base = "https://opencode.ai/zen/go/v1";
+        assert_eq!(guard_url(base, "/v1/responses"), format!("{base}/responses"));
+        assert_eq!(guard_url(base, "/responses"), format!("{base}/responses"));
+        assert_eq!(guard_url(base, "/v1/models"), format!("{base}/models"));
     }
 }

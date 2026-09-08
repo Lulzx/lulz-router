@@ -268,8 +268,8 @@ run any coding-agent harness on your OpenCode Go subscription
   -m, --model <id>    model to run (alias ok: qwen, glm, kimi, gpt, grok, muse, ...)
       --small <id>    background/fast model for Claude Code
   -t, --translate     force the Responses -> Chat Completions bridge
-      --no-translate  refuse instead of bridging (codex talks to the gateway
-                      directly, which only works for a few models)
+      --no-translate  refuse instead of bridging (codex keeps the Responses
+                      wire, which only works for a few models)
       --print         print the resolved command and env, then exit
   -r, --refresh       (models) re-read /v1/models instead of the 12h cache
 
@@ -456,6 +456,9 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
     };
 
     let mut translate = opts.translate;
+    // A bridge or the schema guard runs inside this process, and exec() would
+    // wipe its threads out, so those launches hand the terminal to a child.
+    let mut local_proxy = false;
     let (bin, model, provider, argv, env): LaunchPlan = match harness.as_str() {
         "claude" => {
             let model = pick(DEFAULT_CLAUDE_MODEL)?;
@@ -520,6 +523,7 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
                 });
                 argv.splice(0..0, ["--settings".to_string(), settings.to_string()]);
             }
+            local_proxy = translate;
             let mut env = vec![
                 ("ANTHROPIC_BASE_URL".into(), base),
                 ("ANTHROPIC_API_KEY".into(), key.clone()),
@@ -566,25 +570,33 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
             } else if !zen && opts.native {
                 gate(&model)?;
             }
+            let upstream = if zen {
+                ZEN_V1.to_string()
+            } else {
+                GO_V1.to_string()
+            };
+            // Native Responses traffic runs through the local schema guard:
+            // talking to the gateway directly leaves lulz no way to flatten
+            // the recursive tool schemas some MCP servers ship, and the
+            // provider behind the gateway rejects those outright.
             let base = if translate {
                 let port = proxy::spawn(proxy::Upstream {
-                    base: if zen {
-                        ZEN_V1.to_string()
-                    } else {
-                        GO_V1.to_string()
-                    },
+                    base: upstream,
                     key: key.clone(),
                     session: proxy::session_id(),
                 })
                 .map_err(|e| format!("could not start the translator: {e}"))?;
                 format!("http://127.0.0.1:{port}/v1")
             } else {
-                if zen {
-                    ZEN_V1.to_string()
-                } else {
-                    GO_V1.to_string()
-                }
+                let port = proxy::spawn_guard(proxy::GuardUpstream {
+                    base: upstream,
+                    key: key.clone(),
+                    session: proxy::session_id(),
+                })
+                .map_err(|e| format!("could not start the schema guard: {e}"))?;
+                format!("http://127.0.0.1:{port}/v1")
             };
+            local_proxy = true;
             let provider_id = if zen { "opencodezen" } else { "opencodego" };
             let mut argv = vec![
                 "-c".into(),
@@ -672,9 +684,9 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
         // A stray token would out-rank ANTHROPIC_API_KEY.
         cmd.env_remove("ANTHROPIC_AUTH_TOKEN");
     }
-    if translate {
-        // The translator runs inside this process, and exec() would wipe it
-        // out — so hand the terminal to a child and mirror its exit code.
+    if local_proxy {
+        // Hand the terminal to a child and mirror its exit code, so the local
+        // translator or schema guard keeps running for the whole session.
         let status = cmd
             .status()
             .map_err(|e| format!("failed to run {}: {e}", path.display()))?;
@@ -704,6 +716,8 @@ fn banner(harness: &str, model: &str, provider: &str, translate: bool) {
             "responses -> chat completions"
         };
         eprintln!("  {} {direction}", paint("bridge", "2"));
+    } else if harness == "codex" {
+        eprintln!("  {} responses -> responses", paint("guard", "2"));
     }
     eprintln!();
 }

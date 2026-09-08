@@ -8,6 +8,16 @@ codex ──Responses──▶ 127.0.0.1:<ephemeral> ──Chat Completions─�
 
 Engages automatically for any model the gateway won't serve natively — `lulz launch codex -m qwen3.8-max` just works. `--translate` forces it on; `--no-translate` refuses instead of bridging.
 
+## The schema guard
+
+Native Responses traffic does not go straight to the gateway either:
+
+```
+codex ──Responses──▶ 127.0.0.1:<ephemeral> ──Responses──▶ opencode.ai/zen/go
+```
+
+The wire protocol is untouched. The guard exists because providers behind the gateway reject self-referential JSON Schema outright — `Error from provider (Console Go): ... Recursive JSON schemas are not currently supported` — and MCP servers and plugin tools ship `$ref` cycles routinely. Every tool schema is flattened on the way through: non-recursive refs are inlined, a ref that leads back into itself becomes a permissive `{}`, so the model can still call the tool and the turn no longer 400s. Namespaced tools (`tools[].tools[]`) and the "responses lite" shape (tools inside `input[]`) are flattened too. The upstream response is relayed byte for byte, status and content type included.
+
 Streaming is preserved end to end — upstream chunks are translated and flushed as they arrive, so the TUI stays live. The translation is not cosmetic:
 
 - **`developer` → `system`.** Codex writes its harness prompt as `developer`; Chat Completions 400s the turn.
