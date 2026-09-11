@@ -978,24 +978,46 @@ impl Drop for RawTerminal {
     }
 }
 
-fn render_picker(
-    tty: &mut fs::File,
-    matches: &[&String],
-    query: &str,
-    selected: usize,
-) -> Result<(), String> {
-    write!(
-        tty,
-        "\x1b[u\x1b[J  {} {}\r\n  {} {}_\r\n\r\n",
-        paint("model", "1"),
-        paint("(live)", "2"),
-        paint("filter:", "2"),
-        query,
-    )
-    .map_err(|e| e.to_string())?;
+/// An inline picker frame, redrawn in place.
+///
+/// The frame cannot be found again from a saved cursor position: `CSI s`/`CSI u`
+/// record screen coordinates, which a redraw at the bottom of the window scrolls
+/// out from under, and a terminal that ignores the pair altogether leaves every
+/// frame on screen. So the frame carries its own height and walks the cursor
+/// back up instead.
+#[derive(Default)]
+struct Frame {
+    lines: usize,
+}
 
+impl Frame {
+    /// Returns the cursor to the top of the frame and clears it, so the next
+    /// frame draws over the old one however tall either of them is.
+    fn rewind(&self, tty: &mut fs::File) -> Result<(), String> {
+        if self.lines > 0 {
+            write!(tty, "\x1b[{}A\r", self.lines).map_err(|e| e.to_string())?;
+        }
+        write!(tty, "\x1b[J").map_err(|e| e.to_string())
+    }
+
+    fn draw(&mut self, tty: &mut fs::File, lines: &[String]) -> Result<(), String> {
+        self.rewind(tty)?;
+        for line in lines {
+            write!(tty, "{line}\x1b[K\r\n").map_err(|e| e.to_string())?;
+        }
+        self.lines = lines.len();
+        tty.flush().map_err(|e| e.to_string())
+    }
+}
+
+fn picker_lines(matches: &[&String], query: &str, selected: usize) -> Vec<String> {
+    let mut lines = vec![
+        format!("  {} {}", paint("model", "1"), paint("(live)", "2")),
+        format!("  {} {}_", paint("filter:", "2"), query),
+        String::new(),
+    ];
     if matches.is_empty() {
-        write!(tty, "  {}\r\n", paint("no matching models", "33")).map_err(|e| e.to_string())?;
+        lines.push(format!("  {}", paint("no matching models", "33")));
     } else {
         let start = selected.saturating_sub(9);
         for (index, id) in matches.iter().enumerate().skip(start).take(10) {
@@ -1014,19 +1036,18 @@ fn render_picker(
             } else {
                 shown
             };
-            write!(tty, "  {cursor} {label}\r\n").map_err(|e| e.to_string())?;
+            lines.push(format!("  {cursor} {label}"));
         }
     }
-    write!(
-        tty,
-        "\r\n  {}\r\n",
+    lines.push(String::new());
+    lines.push(format!(
+        "  {}",
         paint(
             "type to filter · ↑↓ move · enter select · ctrl-c cancel",
             "2"
         )
-    )
-    .map_err(|e| e.to_string())?;
-    tty.flush().map_err(|e| e.to_string())
+    ));
+    lines
 }
 
 fn select_model(ids: &[String], preferred: &str) -> Result<String, String> {
@@ -1042,11 +1063,11 @@ fn select_model(ids: &[String], preferred: &str) -> Result<String, String> {
         .iter()
         .position(|id| id.as_str() == preferred)
         .unwrap_or(0);
-    write!(tty, "\x1b[s").map_err(|e| e.to_string())?;
+    let mut frame = Frame::default();
 
     loop {
         selected = selected.min(matches.len().saturating_sub(1));
-        render_picker(&mut tty, &matches, &query, selected)?;
+        frame.draw(&mut tty, &picker_lines(&matches, &query, selected))?;
 
         let mut byte = [0u8; 1];
         tty.read_exact(&mut byte)
@@ -1054,11 +1075,11 @@ fn select_model(ids: &[String], preferred: &str) -> Result<String, String> {
         match byte[0] {
             b'\r' | b'\n' if !matches.is_empty() => {
                 let model = matches[selected].to_string();
-                write!(tty, "\x1b[u\x1b[J").map_err(|e| e.to_string())?;
+                frame.rewind(&mut tty)?;
                 return Ok(model);
             }
             3 => {
-                write!(tty, "\x1b[u\x1b[J").map_err(|e| e.to_string())?;
+                frame.rewind(&mut tty)?;
                 return Err("model selection cancelled".into());
             }
             8 | 127 => {
@@ -1095,14 +1116,11 @@ fn select_model(ids: &[String], preferred: &str) -> Result<String, String> {
     }
 }
 
-fn render_harness_picker(tty: &mut fs::File, selected: usize) -> Result<(), String> {
-    write!(
-        tty,
-        "\x1b[u\x1b[J  {} {}\r\n\r\n",
-        paint("harness", "1"),
-        paint("(pick one)", "2"),
-    )
-    .map_err(|e| e.to_string())?;
+fn harness_lines(selected: usize) -> Vec<String> {
+    let mut lines = vec![
+        format!("  {} {}", paint("harness", "1"), paint("(pick one)", "2")),
+        String::new(),
+    ];
     for (index, (id, desc)) in HARNESSES.iter().enumerate() {
         let cursor = if index == selected {
             paint(">", "35;1")
@@ -1115,15 +1133,14 @@ fn render_harness_picker(tty: &mut fs::File, selected: usize) -> Result<(), Stri
         } else {
             row
         };
-        write!(tty, "  {cursor} {label}\r\n").map_err(|e| e.to_string())?;
+        lines.push(format!("  {cursor} {label}"));
     }
-    write!(
-        tty,
-        "\r\n  {}\r\n",
+    lines.push(String::new());
+    lines.push(format!(
+        "  {}",
         paint("↑↓ move · 1-9 shortcut · enter select · ctrl-c cancel", "2")
-    )
-    .map_err(|e| e.to_string())?;
-    tty.flush().map_err(|e| e.to_string())
+    ));
+    lines
 }
 
 /// Harness first, model second: what bare `lulz` asks before the model picker.
@@ -1135,27 +1152,27 @@ fn select_harness() -> Result<String, String> {
         .open("/dev/tty")
         .map_err(|e| format!("terminal: {e}"))?;
     let mut selected = 0usize;
-    write!(tty, "\x1b[s").map_err(|e| e.to_string())?;
+    let mut frame = Frame::default();
     loop {
-        render_harness_picker(&mut tty, selected)?;
+        frame.draw(&mut tty, &harness_lines(selected))?;
         let mut byte = [0u8; 1];
         tty.read_exact(&mut byte)
             .map_err(|e| format!("terminal input: {e}"))?;
         match byte[0] {
             b'\r' | b'\n' => {
                 let h = HARNESSES[selected].0.to_string();
-                write!(tty, "\x1b[u\x1b[J").map_err(|e| e.to_string())?;
+                frame.rewind(&mut tty)?;
                 return Ok(h);
             }
             3 => {
-                write!(tty, "\x1b[u\x1b[J").map_err(|e| e.to_string())?;
+                frame.rewind(&mut tty)?;
                 return Err("harness selection cancelled".into());
             }
             b'1'..=b'9' => {
                 let i = (byte[0] - b'1') as usize;
                 if i < HARNESSES.len() {
                     let h = HARNESSES[i].0.to_string();
-                    write!(tty, "\x1b[u\x1b[J").map_err(|e| e.to_string())?;
+                    frame.rewind(&mut tty)?;
                     return Ok(h);
                 }
             }
@@ -2160,6 +2177,64 @@ mod tests {
 
         let all = ids(&["deepseek-v4-pro", "qwen3.8-max", "qwen3.7-plus"]);
         assert_eq!(filtered_models(&all, "q38"), vec![&all[1]]);
+    }
+
+    #[test]
+    fn picker_scrolls_a_ten_row_window_over_the_selection() {
+        let all: Vec<String> = (0..25).map(|i| format!("model-{i:02}")).collect();
+        let matches = filtered_models(&all, "");
+        assert_eq!(matches.len(), 25);
+
+        // Ten rows, one blank line above and below, header and footer.
+        let lines = picker_lines(&matches, "", 0);
+        assert_eq!(lines.len(), 15);
+        assert!(lines[3].starts_with("  > model-00"));
+        assert!(lines[12].starts_with("    model-09"));
+
+        // Past the tenth row the window slides, keeping the selection in view.
+        let lines = picker_lines(&matches, "", 20);
+        assert_eq!(lines.len(), 15);
+        assert!(lines[3].starts_with("    model-11"));
+        assert!(lines[12].starts_with("  > model-20"));
+
+        // A query with no matches still gets a frame of its own.
+        let none = filtered_models(&all, "zzz");
+        let lines = picker_lines(&none, "zzz", 0);
+        assert_eq!(lines.len(), 6);
+        assert!(lines[3].contains("no matching models"));
+    }
+
+    #[test]
+    fn a_redraw_rewinds_by_the_height_of_the_frame_before_it() {
+        let path = env::temp_dir().join(format!("lulz-frame-{}", std::process::id()));
+        let mut tty = fs::File::create(&path).unwrap();
+        let mut frame = Frame::default();
+        // Tall frame, then a short one, then the erasing exit: each step
+        // walks back up its own height before it overwrites anything.
+        frame.draw(&mut tty, &ids(&["one", "two"])).unwrap();
+        frame.draw(&mut tty, &ids(&["three"])).unwrap();
+        frame.rewind(&mut tty).unwrap();
+        drop(tty);
+        let out = fs::read_to_string(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            out,
+            "\x1b[Jone\x1b[K\r\ntwo\x1b[K\r\n\
+             \x1b[2A\r\x1b[Jthree\x1b[K\r\n\
+             \x1b[1A\r\x1b[J"
+        );
+    }
+
+    #[test]
+    fn a_frame_is_as_tall_as_what_it_draws() {
+        // The redraw walks back up exactly this many rows, so a frame that
+        // under- or over-counts itself leaves the last one on screen — the
+        // stacked pickers this replaced.
+        for selected in 0..HARNESSES.len() {
+            assert_eq!(harness_lines(selected).len(), HARNESSES.len() + 4);
+        }
+        let all = ids(&["a", "b"]);
+        assert_eq!(picker_lines(&filtered_models(&all, ""), "", 0).len(), 7);
     }
 
     #[test]
