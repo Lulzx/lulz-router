@@ -5,6 +5,7 @@
 //! harness so signals, terminal state, cwd and exit codes behave natively.
 
 mod proxy;
+mod update;
 
 use std::collections::BTreeMap;
 use std::env;
@@ -168,6 +169,9 @@ const HARNESSES: &[(&str, &str)] = &[
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
+    if args.first().map(String::as_str) != Some("update") {
+        update::auto(&args);
+    }
     if args.is_empty() {
         // Bare `lulz` is a harness choice followed by a model choice.
         // Non-interactive stdin (scripts, pipes) keeps the old default so
@@ -216,6 +220,7 @@ fn main() {
         "auth" | "key" => cmd_auth(&args[1..]),
         "doctor" | "probe" => cmd_doctor(),
         "default" | "defaults" => cmd_default(&args[1..]),
+        "update" => update::cmd_update(),
         "-V" | "--version" | "version" => {
             println!("lulz {VERSION}");
             Ok(())
@@ -247,6 +252,7 @@ run any coding-agent harness on your OpenCode Go subscription
   lulz auth [--save]
   lulz doctor
   lulz default <harness> <model>
+  lulz update                       # install the latest release now
 
 {harnesses}
   claude      Claude Code       (Anthropic Messages)
@@ -280,6 +286,9 @@ Bare interactive launches always refresh /v1/models and open the picker.
 Type to fuzzy-filter, use arrows to move, and press enter to select.
 The current OpenCode Zen free models appear first and are labelled `[Zen]`;
 paid Zen models are never included. OpenCode Go models follow them, labelled `[Go]`.
+
+Once a day an interactive run checks GitHub for a newer release and, if there
+is one, installs it and carries on. Set LULZ_NO_UPDATE=1 to turn that off.
 ",
         name = paint("lulz", "35;1"),
         usage = paint("usage", "1"),

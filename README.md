@@ -29,7 +29,7 @@ Two model sources: **Zen** (free, via `OPENCODE_ZEN_API_KEY`) and **Go** (subscr
 
 ## Docs
 
-- [Install](docs/install.md) — script, source build, dependencies
+- [Install](docs/install.md) — script, source build, updates, dependencies
 - [Usage](docs/usage.md) — picker, aliases, defaults, `models`, `doctor`
 - [How it works](docs/how-it-works.md) — env/config injection per harness
 - [Capability matching](docs/capabilities.md) — probed protocol table, roster cache
