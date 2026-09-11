@@ -690,12 +690,23 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
 
     let mut cmd = Command::new(&path);
     cmd.args(&argv);
-    for (k, v) in env {
+    for (k, v) in &env {
         cmd.env(k, v);
     }
     if harness == "claude" {
         // A stray token would out-rank ANTHROPIC_API_KEY.
         cmd.env_remove("ANTHROPIC_AUTH_TOKEN");
+        // A logged-in Claude Code only honours ANTHROPIC_API_KEY once it has
+        // been approved; a declined key silently falls back to the claude.ai
+        // OAuth token, which the gateway answers with `401 Missing API key`.
+        if let Some((_, key)) = env.iter().find(|(k, _)| k == "ANTHROPIC_API_KEY") {
+            if let Err(e) = approve_claude_key(key) {
+                eprintln!(
+                    "  {} could not pre-approve the key for Claude Code: {e}",
+                    paint("warn", "33;1")
+                );
+            }
+        }
     }
     if local_proxy {
         // Hand the terminal to a child and mirror its exit code, so the local
@@ -1706,6 +1717,78 @@ fn cmd_default(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+// ------------------------------------------------------- claude approval ---
+
+fn claude_config_path() -> PathBuf {
+    match env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) => PathBuf::from(dir).join(".claude.json"),
+        None => home().join(".claude.json"),
+    }
+}
+
+/// Record `key` the way Claude Code does when you answer "yes" to its
+/// custom-API-key prompt: the last 20 characters under
+/// `customApiKeyResponses.approved`, and out of `rejected`. Returns whether
+/// anything changed.
+fn approve_key(cfg: &mut serde_json::Value, key: &str) -> bool {
+    let tail: String = {
+        let chars: Vec<char> = key.chars().collect();
+        chars[chars.len().saturating_sub(20)..].iter().collect()
+    };
+    let Some(root) = cfg.as_object_mut() else {
+        return false;
+    };
+    let responses = root
+        .entry("customApiKeyResponses")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(responses) = responses.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    if let Some(rejected) = responses.get_mut("rejected").and_then(|v| v.as_array_mut()) {
+        let before = rejected.len();
+        rejected.retain(|v| v.as_str() != Some(tail.as_str()));
+        changed |= rejected.len() != before;
+    }
+    let approved = responses
+        .entry("approved")
+        .or_insert_with(|| serde_json::json!([]));
+    if !approved.is_array() {
+        *approved = serde_json::json!([]);
+    }
+    let approved = approved.as_array_mut().unwrap();
+    if !approved.iter().any(|v| v.as_str() == Some(tail.as_str())) {
+        approved.push(tail.into());
+        changed = true;
+    }
+    changed
+}
+
+/// Pre-approve the gateway key in Claude Code's own config. No config file
+/// means Claude Code has never run, so there is no login to fall back to.
+fn approve_claude_key(key: &str) -> Result<(), String> {
+    let p = claude_config_path();
+    let Ok(body) = fs::read_to_string(&p) else {
+        return Ok(());
+    };
+    let mut cfg: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("{}: {e}", p.display()))?;
+    if !approve_key(&mut cfg, key) {
+        return Ok(());
+    }
+    let out = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
+    // Other Claude Code sessions read this file; swap it in whole.
+    let tmp = p.with_extension(format!("json.lulz-{}", std::process::id()));
+    fs::write(&tmp, out).map_err(|e| e.to_string())?;
+    if let Ok(meta) = fs::metadata(&p) {
+        let _ = fs::set_permissions(&tmp, meta.permissions());
+    }
+    fs::rename(&tmp, &p).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        e.to_string()
+    })
+}
+
 // ----------------------------------------------------------------- utils ---
 
 fn home() -> PathBuf {
@@ -1965,6 +2048,25 @@ mod tests {
         assert!(is_secret("OPENCODE_API_KEY"));
         assert!(is_secret("ANTHROPIC_AUTH_TOKEN"));
         assert!(!is_secret("CLAUDE_CODE_MAX_CONTEXT_TOKENS"));
+    }
+
+    #[test]
+    fn a_declined_gateway_key_is_approved_for_claude_code() {
+        let key = "sk-0123456789abcdefghijklmnopqrstuvwxyz";
+        let tail = "ghijklmnopqrstuvwxyz";
+        let mut cfg = serde_json::json!({
+            "oauthAccount": {},
+            "customApiKeyResponses": {"approved": [], "rejected": [tail, "other"]}
+        });
+        assert!(approve_key(&mut cfg, key));
+        assert_eq!(cfg["customApiKeyResponses"]["approved"], serde_json::json!([tail]));
+        assert_eq!(cfg["customApiKeyResponses"]["rejected"], serde_json::json!(["other"]));
+        // Already approved: leave the file alone.
+        assert!(!approve_key(&mut cfg, key));
+
+        let mut fresh = serde_json::json!({});
+        assert!(approve_key(&mut fresh, key));
+        assert_eq!(fresh["customApiKeyResponses"]["approved"], serde_json::json!([tail]));
     }
 
     #[test]
