@@ -525,20 +525,15 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
                 GO_ROOT.to_string()
             };
             let mut argv = opts.rest.clone();
-            if translate {
-                // Keep the provider model's real identity in Claude Code,
-                // but describe its harness behavior using Claude's public
-                // custom-picker schema. This avoids unknown-model guesses;
-                // the bridge still forces `model` upstream independently.
-                let settings = serde_json::json!({
-                    "modelPicker": {"options": [{
-                        "model": model,
-                        "label": model,
-                        "behavesAs": "claude-sonnet-4-6"
-                    }]}
-                });
-                argv.splice(0..0, ["--settings".to_string(), settings.to_string()]);
-            }
+            // Keep the provider model's real identity in Claude Code, but
+            // describe its harness behavior using Claude's public
+            // custom-picker schema. Without a row, a model missing from
+            // Claude Code's catalog warns on every launch. `behavesAs` only
+            // describes behavior; the id on the wire stays the gateway's.
+            argv.splice(
+                0..0,
+                ["--settings".to_string(), picker_settings(&model, &small).to_string()],
+            );
             local_proxy = translate;
             let mut env = vec![
                 ("ANTHROPIC_BASE_URL".into(), base),
@@ -738,6 +733,23 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
         std::process::exit(status.code().unwrap_or(1));
     }
     Err(format!("failed to exec {}: {}", path.display(), cmd.exec()))
+}
+
+/// Claude Code's custom model-picker rows for the main and background models.
+fn picker_settings(model: &str, small: &str) -> serde_json::Value {
+    let mut options = vec![serde_json::json!({
+        "model": model,
+        "label": model,
+        "behavesAs": "claude-sonnet-4-6"
+    })];
+    if small != model {
+        options.push(serde_json::json!({
+            "model": small,
+            "label": small,
+            "behavesAs": "claude-haiku-4-5"
+        }));
+    }
+    serde_json::json!({"modelPicker": {"options": options}})
 }
 
 fn banner(harness: &str, model: &str, provider: &str, translate: bool) {
@@ -2076,6 +2088,20 @@ mod tests {
         let mut fresh = serde_json::json!({});
         assert!(approve_key(&mut fresh, key));
         assert_eq!(fresh["customApiKeyResponses"]["approved"], serde_json::json!([tail]));
+    }
+
+    #[test]
+    fn both_claude_models_get_a_picker_row() {
+        let s = picker_settings("deepseek-v4.1-flash", "deepseek-v4-flash");
+        let rows = s["modelPicker"]["options"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["model"], "deepseek-v4.1-flash");
+        assert_eq!(rows[0]["behavesAs"], "claude-sonnet-4-6");
+        assert_eq!(rows[1]["model"], "deepseek-v4-flash");
+        assert_eq!(rows[1]["behavesAs"], "claude-haiku-4-5");
+        // Same model for both roles: one row, not a duplicate.
+        let s = picker_settings("deepseek-v4-flash", "deepseek-v4-flash");
+        assert_eq!(s["modelPicker"]["options"].as_array().unwrap().len(), 1);
     }
 
     #[test]

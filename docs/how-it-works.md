@@ -14,6 +14,17 @@ CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000         # else it assumes 200k
 
 `ANTHROPIC_API_KEY`, not `ANTHROPIC_AUTH_TOKEN` — the gateway's Messages endpoint authenticates on `x-api-key` and 401s on `Authorization: Bearer`.
 
+Both models also get a row in Claude Code's custom model picker, passed with `--settings`:
+
+```json
+{"modelPicker": {"options": [
+  {"model": "minimax-m3", "label": "minimax-m3", "behavesAs": "claude-sonnet-4-6"},
+  {"model": "deepseek-v4-flash", "label": "deepseek-v4-flash", "behavesAs": "claude-haiku-4-5"}
+]}}
+```
+
+Without a row, Claude Code warns on every launch that the model isn't in its catalog. `behavesAs` only tells Claude Code how the model behaves. The id sent to the gateway is still the gateway's own.
+
 **Codex** gets an ephemeral provider on the command line, pointed at lulz's local schema guard (native Responses models) or at the translator (everything else):
 
 ```sh
