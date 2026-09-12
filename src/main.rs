@@ -784,7 +784,9 @@ fn banner(harness: &str, model: &str, provider: &str, translate: bool) {
 
 fn cmd_models(args: &[String]) -> Result<(), String> {
     let force = args.iter().any(|a| a == "--refresh" || a == "-r");
-    let key = find_key().ok().map(|key| key.value).unwrap_or_default();
+    let key_res = find_key();
+    let key_err = key_res.as_ref().err().cloned();
+    let key = key_res.map(|key| key.value).unwrap_or_default();
     let free = zen_free_roster();
     // The default prints first so the eye lands on the common choice.
     let go = pin_defaults(if key.is_empty() {
@@ -793,7 +795,8 @@ fn cmd_models(args: &[String]) -> Result<(), String> {
         roster(&key, force)
     });
     if free.is_empty() && go.is_empty() {
-        return Err(format!("could not read the model list from {GO_V1}/models"));
+        return Err(key_err
+            .unwrap_or_else(|| format!("could not read the model list from {GO_V1}/models")));
     }
 
     println!("\n{}\n", paint("models", "1"));
@@ -841,6 +844,11 @@ fn cmd_models(args: &[String]) -> Result<(), String> {
             codex,
             mark(true)
         );
+    }
+    // Without a key the Go rows vanish; say why instead of looking like an
+    // empty gateway.
+    if let Some(err) = &key_err {
+        println!("\n  {} {}", paint("[Go] hidden:", "33"), err.replace("\n  ", "\n    "));
     }
     println!(
         "\n  {} lulz launch claude -m {}\n  {} lulz doctor\n  {} {}\n",
