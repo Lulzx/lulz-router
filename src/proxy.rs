@@ -1545,6 +1545,20 @@ impl Turn {
             }))?;
         }
         for (i, item) in self.items().iter().enumerate() {
+            // Chat tool calls are buffered until their fragmented arguments
+            // are complete. Consumers still need the opening lifecycle event
+            // before `done` to create the tool block (including Claude's
+            // Messages bridge when the two translators are composed).
+            if item["type"] == "function_call" {
+                let mut opening = item.clone();
+                opening["arguments"] = json!("");
+                opening["status"] = json!("in_progress");
+                emit(&json!({
+                    "type": "response.output_item.added",
+                    "output_index": i,
+                    "item": opening,
+                }))?;
+            }
             emit(&json!({
                 "type": "response.output_item.done",
                 "output_index": i,
@@ -1989,6 +2003,40 @@ mod tests {
         assert_eq!(got["input"][0]["type"], "function_call");
         assert_eq!(got["input"][1]["type"], "function_call_output");
         assert_eq!(got["tools"][0]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn composed_claude_chat_bridge_preserves_tool_round_trip() {
+        let events = drain(&[
+            r#"data: {"id":"c2","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_x","function":{"name":"shell","arguments":""}}]}}]}"#,
+            r#"data: {"id":"c2","choices":[{"delta":{"tool_calls":[{"index":0,"id":"","function":{"arguments":"{\"cmd\":\"pwd\"}"}}]}}]}"#,
+            "data: [DONE]",
+        ]);
+        let mut turn = AnthropicTurn::new("glm-5.3-flash");
+        let mut sink = |_: &str, _: &Value| Ok(());
+        let first = format!("data: {}", events[0]);
+        turn.start(&first, &mut sink).unwrap();
+        for event in events {
+            turn.feed(&format!("data: {event}"), &mut sink).unwrap();
+        }
+        let response = turn.response();
+        assert_eq!(response["stop_reason"], "tool_use");
+        assert_eq!(response["content"][0]["id"], "call_x");
+        assert_eq!(response["content"][0]["input"]["cmd"], "pwd");
+        let followup = json!({
+            "messages": [
+                {"role":"assistant", "content":response["content"]},
+                {"role":"user", "content":[{"type":"tool_result", "tool_use_id":"call_x", "content":"/tmp"}]}
+            ],
+            "tools":[{"name":"shell", "input_schema":{"type":"object", "properties":{"cmd":{"type":"string"}}}}]
+        });
+        let chat = to_chat(&anthropic_to_responses(&followup, "glm-5.3-flash"));
+        assert_eq!(chat["model"], "glm-5.3-flash");
+        assert_eq!(chat["messages"][0]["tool_calls"][0]["id"], "call_x");
+        assert_eq!(chat["messages"][1]["role"], "tool");
+        assert_eq!(chat["messages"][1]["tool_call_id"], "call_x");
+        assert_eq!(chat["messages"][1]["content"], "/tmp");
+        assert_eq!(chat["tools"][0]["function"]["name"], "shell");
     }
 
     #[test]

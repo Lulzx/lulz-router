@@ -480,13 +480,12 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
             let model = pick(DEFAULT_CLAUDE_MODEL)?;
             let zen = is_zen(&model);
             let key = if zen { &zen_key } else { &go_key };
-            // Some gateway models only expose an OpenAI Responses route.
-            // Translate those for Claude instead of rejecting a model the
-            // subscription can serve.
+            // Fall back to Responses, then compose both local bridges for
+            // models that the gateway serves only over Chat Completions.
             translate = zen || opts.translate || (!opts.native && !can_run("claude", &model));
             if zen && opts.native {
                 return Err(format!("`{model}` is a Zen free model and requires lulz's protocol bridge; remove --no-translate"));
-            } else if !zen && (opts.native || !translate || !can_run("codex", &model)) {
+            } else if !zen && (opts.native || !translate) {
                 gate(&model)?;
             }
             let small = ensure_served(
@@ -500,9 +499,9 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
             // only; ANTHROPIC_AUTH_TOKEN would send `Authorization: Bearer`
             // and come back 401.
             let base = if translate {
-                let upstream = if zen && zen_wire(&model) == Some(ZenWire::Chat) {
+                let upstream = if claude_needs_chat_bridge(zen, &model) {
                     let port = proxy::spawn(proxy::Upstream {
-                        base: ZEN_V1.to_string(),
+                        base: if zen { ZEN_V1 } else { GO_V1 }.to_string(),
                         key: key.clone(),
                         session: proxy::session_id(),
                     })
@@ -769,7 +768,11 @@ fn banner(harness: &str, model: &str, provider: &str, translate: bool) {
     eprintln!("  {}     {model}", paint("model", "2"));
     if translate {
         let direction = if harness == "claude" {
-            "messages <-> responses"
+            if claude_needs_chat_bridge(zen_wire(model).is_some(), model) {
+                "messages <-> responses <-> chat completions"
+            } else {
+                "messages <-> responses"
+            }
         } else {
             "responses -> chat completions"
         };
@@ -840,7 +843,11 @@ fn cmd_models(args: &[String]) -> Result<(), String> {
         };
         println!(
             "  {label:<48} {ctx:>9}  {:<8} {:<8} {}",
-            mark(can_run("claude", id)),
+            if can_run("claude", id) {
+                paint("yes", "32")
+            } else {
+                paint("bridge", "36")
+            },
             codex,
             mark(true)
         );
@@ -884,6 +891,14 @@ fn wire_harness(harness: &str) -> &str {
         "codex"
     } else {
         harness
+    }
+}
+
+fn claude_needs_chat_bridge(zen: bool, model: &str) -> bool {
+    if zen {
+        zen_wire(model) == Some(ZenWire::Chat)
+    } else {
+        !can_run("codex", model)
     }
 }
 
@@ -1958,6 +1973,16 @@ mod tests {
     fn reads_the_models_list() {
         let s = r#"{"object":"list","data":[{"id":"glm-5"},{"id":"kimi-k3"},{"id":"glm-5"}]}"#;
         assert_eq!(json_ids(s), vec!["glm-5", "kimi-k3"]);
+    }
+
+    #[test]
+    fn claude_chat_fallback_preserves_responses_and_zen_routes() {
+        assert!(claude_needs_chat_bridge(false, "glm-5.3-flash"));
+        assert!(claude_needs_chat_bridge(false, "glm-5.3"));
+        assert!(!claude_needs_chat_bridge(false, "muse-spark-1.3-contributor"));
+        assert!(!claude_needs_chat_bridge(false, "gpt-5.6-luna"));
+        assert!(claude_needs_chat_bridge(true, "big-pickle"));
+        assert!(!claude_needs_chat_bridge(true, "muse-spark-1.3-contributor-free"));
     }
 
     #[test]

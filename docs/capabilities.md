@@ -7,10 +7,10 @@ The gateway doesn't serve every model over every protocol — and some accept pl
 | qwen3.5/3.6/3.7/3.8, minimax-m2.5/m2.7/m3, kimi-k3 | native | bridged | Messages+tools ok; no `/responses` |
 | deepseek-v4-flash/pro | native | native | both |
 | muse-spark-1.2/1.3 | bridged | native | Responses-only on the current gateway |
-| gpt-5.6-luna | ❌ | native | Messages 500s for this model |
-| grok-4.5 | ❌ | native | Messages 401s for this model |
-| glm-5…5.3 + glm-5.3-flash | ❌ | bridged | Messages rejects tool schemas / 500s |
-| hy3, kimi-k2.x, mimo-*, ox-alpha | ❌ | bridged | Messages rejects tool schemas |
+| gpt-5.6-luna | bridged | native | Claude uses the Responses bridge |
+| grok-4.5 | bridged | native | Claude uses the Responses bridge |
+| glm-5…5.3 + glm-5.3-flash | bridged | bridged | Claude composes Messages → Responses → Chat Completions |
+| hy3, kimi-k2.x, mimo-*, ox-alpha | bridged | bridged | Claude composes Messages → Responses → Chat Completions |
 
 The *roster* is never hardcoded: `lulz` reads the gateway's `/v1/models` and caches ids at `~/.cache/lulz/models` for 12h. Bare interactive launches bypass the cache. The table only supplies what the endpoint doesn't — protocol support and context window. `--refresh` re-reads on demand; on failure it falls back to stale cache, then stops gating.
 

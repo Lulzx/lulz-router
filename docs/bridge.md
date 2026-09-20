@@ -31,6 +31,8 @@ Streaming is preserved end to end — upstream chunks are translated and flushed
 
 For Responses-native models (Muse Spark 1.3), `lulz` bridges the other way: Claude Code sees a catalogued Sonnet-compatible model while the local bridge rewrites to the selected provider model and translates streaming text and tool calls back to Messages events.
 
+For Go models without either native Messages or Responses support (including GLM), Claude automatically composes the two bridges: Messages → local Responses → Chat Completions. `lulz launch claude -m glm-5.3-flash` uses this route; `--no-translate` still requires native Messages support.
+
 The same composition makes Zen's free Chat Completions models available to both harnesses. `lulz` picks the Zen or Go endpoint from the chosen model (`opencode/<id>` vs `opencode-go/<id>`). `OPENCODE_ZEN_API_KEY` is preferred when set, else the existing OpenCode credential is reused.
 
 Debug: `LULZ_DEBUG=/tmp/bridge.log lulz launch codex -m glm-5.3` mirrors every request, translated body, and emitted event into the log.
