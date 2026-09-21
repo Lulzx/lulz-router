@@ -10,7 +10,7 @@ The gateway doesn't serve every model over every protocol — and some accept pl
 | gpt-5.6-luna | bridged | native | Claude uses the Responses bridge |
 | grok-4.5 | bridged | native | Claude uses the Responses bridge |
 | glm-5…5.3 + glm-5.3-flash | bridged | bridged | Claude composes Messages → Responses → Chat Completions |
-| hy3, kimi-k2.x, mimo-*, ox-alpha | bridged | bridged | Claude composes Messages → Responses → Chat Completions |
+| hy3, kimi-k2.x, mimo-* (incl. mimo-v2.6-flash/pro), ox-alpha | bridged | bridged | Claude composes Messages → Responses → Chat Completions |
 
 The *roster* is never hardcoded: `lulz` reads the gateway's `/v1/models` and caches ids at `~/.cache/lulz/models` for 12h. Bare interactive launches bypass the cache. The table only supplies what the endpoint doesn't — protocol support and context window. `--refresh` re-reads on demand; on failure it falls back to stale cache, then stops gating.
 

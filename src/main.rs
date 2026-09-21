@@ -80,6 +80,12 @@ const MODELS: &[Caps] = &[
     m("mimo-v2-pro", 1048576, false, false),
     m("mimo-v2.5", 1000000, false, false),
     m("mimo-v2.5-pro", 1048576, false, false),
+    // mimo-v2.6 503s on both /messages and /responses (repeatedly, while
+    // other models answer on the same endpoints); Chat Completions serves it
+    // with tool calls, so both harnesses go through the bridge. Context per
+    // models.dev.
+    m("mimo-v2.6-flash", 1048576, false, false),
+    m("mimo-v2.6-pro", 1048576, false, false),
     m("minimax-m2.5", 204800, true, false),
     m("minimax-m2.7", 204800, true, false),
     m("minimax-m3", 1000000, true, false),
@@ -120,6 +126,11 @@ const ZEN_FREE: &[ZenFree] = &[
         wire: ZenWire::Chat,
     },
     ZenFree {
+        id: "mimo-v2.6-flash-free",
+        ctx: 200000,
+        wire: ZenWire::Chat,
+    },
+    ZenFree {
         id: "ling-3.0-flash-fin-free",
         ctx: 200000,
         wire: ZenWire::Chat,
@@ -155,7 +166,7 @@ const ALIASES: &[(&str, &str)] = &[
     ("luna", "gpt-5.6-luna"),
     ("grok", "grok-4.5"),
     ("deepseek", "deepseek-v4-pro"),
-    ("mimo", "mimo-v2.5-pro"),
+    ("mimo", "mimo-v2.6-pro"),
     ("muse", "muse-spark-1.3-contributor"),
     ("hy", "hy3"),
 ];
