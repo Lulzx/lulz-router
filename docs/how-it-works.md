@@ -14,6 +14,8 @@ CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000         # else it assumes 200k
 
 `ANTHROPIC_API_KEY`, not `ANTHROPIC_AUTH_TOKEN` — the gateway's Messages endpoint authenticates on `x-api-key` and 401s on `Authorization: Bearer`.
 
+When the main model is bridged (see [the bridge](bridge.md)), `ANTHROPIC_BASE_URL` points at the local bridge instead, and requests for `ANTHROPIC_SMALL_FAST_MODEL` are passed straight through to the gateway's Messages endpoint rather than rewritten to the main model, so Claude Code's time-boxed background prompts (goal checks, summaries) still run on the fast model they were sent to.
+
 Both models also get a row in Claude Code's custom model picker, passed with `--settings`:
 
 ```json

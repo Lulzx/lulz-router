@@ -99,6 +99,22 @@ pub struct ResponsesUpstream {
     pub key: String,
     pub model: String,
     pub session: String,
+    /// Models the gateway serves over native Messages, relayed untouched
+    /// instead of being rewritten to `model`. Claude Code's haiku-tier
+    /// traffic (`ANTHROPIC_SMALL_FAST_MODEL`) lands here: the goal-check and
+    /// other background prompts run on a hard 30 s budget, and a flash model
+    /// answering natively fits it where the bridged main model does not.
+    pub native: Option<NativeMessages>,
+}
+
+/// The gateway's own Messages endpoint, for models that speak it natively.
+#[derive(Clone)]
+pub struct NativeMessages {
+    /// `.../v1` root; `/messages` is appended.
+    pub base: String,
+    /// The gateway's Messages endpoint authenticates on `x-api-key`.
+    pub key: String,
+    pub models: Vec<String>,
 }
 
 /// Bind an ephemeral Messages endpoint for Claude Code. The selected provider
@@ -114,6 +130,7 @@ pub fn spawn_anthropic(up: ResponsesUpstream) -> std::io::Result<u16> {
                 key: up.key.clone(),
                 model: up.model.clone(),
                 session: up.session.clone(),
+                native: up.native.clone(),
             };
             thread::spawn(move || {
                 let _ = serve_anthropic(conn, &up);
@@ -161,6 +178,15 @@ fn serve_anthropic(mut sock: TcpStream, up: &ResponsesUpstream) -> std::io::Resu
             );
         }
     };
+    let wanted = req.get("model").and_then(Value::as_str).unwrap_or("");
+    if let Some(native) = up
+        .native
+        .as_ref()
+        .filter(|n| n.models.iter().any(|m| m == wanted))
+    {
+        debug("anthropic-native", wanted);
+        return relay_messages(&mut sock, native, &headers, &body, &up.session);
+    }
     let wants_stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let responses = anthropic_to_responses(&req, &up.model);
     debug("messages-in", &req.to_string());
@@ -231,6 +257,49 @@ fn anthropic_sse(sock: &mut TcpStream, name: &str, value: &Value) -> std::io::Re
     debug("anthropic-sse", &value.to_string());
     sock.write_all(format!("event: {name}\ndata: {value}\n\n").as_bytes())?;
     sock.flush()
+}
+
+/// Forward a Messages request to the gateway's own Messages endpoint and
+/// relay the answer byte for byte, exactly as an unbridged launch would.
+/// Claude Code's `anthropic-version` and `anthropic-beta` headers travel
+/// with it; the key goes on `x-api-key`, which is what the endpoint checks.
+fn relay_messages(
+    sock: &mut TcpStream,
+    native: &NativeMessages,
+    headers: &[(String, String)],
+    body: &[u8],
+    session: &str,
+) -> std::io::Result<()> {
+    let mut command = upstream_curl(
+        format!("{}/messages", native.base),
+        "",
+        &request_session(headers, session),
+        true,
+    );
+    if !native.key.is_empty() {
+        command
+            .args(["--variable", "%LULZ_KEY"])
+            .args(["--expand-header", "x-api-key: {{LULZ_KEY}}"])
+            .env("LULZ_KEY", &native.key);
+    }
+    let mut versioned = false;
+    for (name, value) in headers {
+        let lower = name.to_ascii_lowercase();
+        if lower == "anthropic-version" || lower == "anthropic-beta" {
+            versioned |= lower == "anthropic-version";
+            command.args(["-H", &format!("{lower}: {value}")]);
+        }
+    }
+    if !versioned {
+        command.args(["-H", "anthropic-version: 2023-06-01"]);
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child.stdin.take().unwrap().write_all(body)?;
+    relay_upstream(sock, child)
 }
 
 /// Binds an ephemeral loopback port and serves until the process exits.
@@ -843,10 +912,14 @@ fn serve_guard(mut sock: TcpStream, up: &GuardUpstream) -> std::io::Result<()> {
         .stderr(Stdio::piped())
         .spawn()?;
     child.stdin.take().unwrap().write_all(&payload)?;
-    let mut out = BufReader::new(child.stdout.take().unwrap());
+    relay_upstream(&mut sock, child)
+}
 
-    // -i puts the upstream status line and headers in front of the body, so the
-    // harness sees the gateway's own errors instead of a fake 200 stream.
+/// Relay a `curl -i` upstream to the harness: its status line and content
+/// type first, then the body as it arrives, so the harness sees the
+/// gateway's own errors instead of a fake 200 stream.
+fn relay_upstream(sock: &mut TcpStream, mut child: std::process::Child) -> std::io::Result<()> {
+    let mut out = BufReader::new(child.stdout.take().unwrap());
     let mut line = String::new();
     if out.read_line(&mut line)? == 0 {
         let mut err = String::new();
@@ -860,7 +933,7 @@ fn serve_guard(mut sock: TcpStream, up: &GuardUpstream) -> std::io::Result<()> {
             err.trim().to_string()
         };
         let payload = json!({"error": {"message": body, "type": "upstream_error"}}).to_string();
-        return write_head(&mut sock, 502, "application/json", Some(payload.as_bytes()));
+        return write_head(sock, 502, "application/json", Some(payload.as_bytes()));
     }
     let status = line
         .split_whitespace()
@@ -879,7 +952,7 @@ fn serve_guard(mut sock: TcpStream, up: &GuardUpstream) -> std::io::Result<()> {
             }
         }
     }
-    write_status_head(&mut sock, status, &ctype)?;
+    write_status_head(sock, status, &ctype)?;
     let mut buf = [0u8; 8192];
     loop {
         let read = out.read(&mut buf)?;
@@ -1039,6 +1112,7 @@ struct AnthropicTurn {
     content: Vec<Value>,
     used_tool: bool,
     input_tokens: u64,
+    cached_tokens: u64,
     output_tokens: u64,
     stop_reason: String,
 }
@@ -1052,6 +1126,7 @@ impl AnthropicTurn {
             content: Vec::new(),
             used_tool: false,
             input_tokens: 0,
+            cached_tokens: 0,
             output_tokens: 0,
             stop_reason: "end_turn".into(),
         }
@@ -1187,17 +1262,31 @@ impl AnthropicTurn {
                     self.stop_reason = "tool_use".into();
                 }
                 let usage = &event["response"]["usage"];
-                self.input_tokens = usage
+                let input = usage
                     .get("input_tokens")
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
+                // Responses counts cached tokens inside input_tokens;
+                // Messages reports them separately.
+                self.cached_tokens = usage
+                    .pointer("/input_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .min(input);
+                self.input_tokens = input - self.cached_tokens;
                 self.output_tokens = usage
                     .get("output_tokens")
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
+                // Input usage only becomes known here. The Anthropic SDK
+                // folds message_delta usage into the final message, and
+                // Claude Code sizes context compaction and the transcript
+                // it hands to background checks from that number; a zero
+                // means "never trim", which is how a goal check ends up
+                // shipping the whole session and timing out.
                 emit(
                     "message_delta",
-                    &json!({"type":"message_delta","delta":{"stop_reason":self.stop_reason,"stop_sequence":Value::Null},"usage":{"output_tokens":self.output_tokens}}),
+                    &json!({"type":"message_delta","delta":{"stop_reason":self.stop_reason,"stop_sequence":Value::Null},"usage":self.usage()}),
                 )?;
                 emit("message_stop", &json!({"type":"message_stop"}))?;
             }
@@ -1230,10 +1319,19 @@ impl AnthropicTurn {
         Ok(())
     }
 
+    fn usage(&self) -> Value {
+        json!({
+            "input_tokens": self.input_tokens,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": self.cached_tokens,
+            "output_tokens": self.output_tokens,
+        })
+    }
+
     fn response(&self) -> Value {
         json!({"id":self.id,"type":"message","role":"assistant","model":self.model,
             "content":self.content,"stop_reason":self.stop_reason,"stop_sequence":Value::Null,
-            "usage":{"input_tokens":self.input_tokens,"output_tokens":self.output_tokens}})
+            "usage":self.usage()})
     }
 }
 
@@ -2067,6 +2165,42 @@ mod tests {
             .any(|(name, value)| name == "message_delta"
                 && value["delta"]["stop_reason"] == "tool_use"));
         assert_eq!(turn.response()["content"][0]["input"]["cmd"], "pwd");
+    }
+
+    #[test]
+    fn anthropic_stream_reports_input_usage_at_the_end() {
+        let created = r#"data: {"type":"response.created","response":{"id":"resp_1"}}"#;
+        let lines = [
+            r#"data: {"type":"response.content_part.added","output_index":0,"part":{"type":"output_text","text":""}}"#,
+            r#"data: {"type":"response.output_text.delta","output_index":0,"delta":"ok"}"#,
+            r#"data: {"type":"response.content_part.done","output_index":0}"#,
+            r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":120000,"input_tokens_details":{"cached_tokens":100000},"output_tokens":7}}}"#,
+        ];
+        let mut turn = AnthropicTurn::new("mimo-v2.6-flash");
+        let mut events: Vec<(String, Value)> = Vec::new();
+        let mut emit = |name: &str, value: &Value| {
+            events.push((name.to_string(), value.clone()));
+            Ok(())
+        };
+        turn.start(created, &mut emit).unwrap();
+        for line in lines {
+            turn.feed(line, &mut emit).unwrap();
+        }
+        // Claude Code sizes compaction and the goal-check transcript from the
+        // usage the SDK folds in from message_delta; zero there means the
+        // whole session gets shipped to every background check.
+        let delta = events
+            .iter()
+            .find(|(name, _)| name == "message_delta")
+            .map(|(_, value)| value.clone())
+            .unwrap();
+        assert_eq!(delta["usage"]["input_tokens"], 20000);
+        assert_eq!(delta["usage"]["cache_read_input_tokens"], 100000);
+        assert_eq!(delta["usage"]["output_tokens"], 7);
+        assert_eq!(delta["delta"]["stop_reason"], "end_turn");
+        let whole = turn.response();
+        assert_eq!(whole["usage"]["input_tokens"], 20000);
+        assert_eq!(whole["usage"]["cache_read_input_tokens"], 100000);
     }
 
     // ------------------------------------------------------- schema guard --

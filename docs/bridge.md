@@ -31,6 +31,8 @@ Streaming is preserved end to end — upstream chunks are translated and flushed
 
 For Responses-native models (Muse Spark 1.3), `lulz` bridges the other way: Claude Code sees a catalogued Sonnet-compatible model while the local bridge rewrites to the selected provider model and translates streaming text and tool calls back to Messages events.
 
+Two things about that bridge exist because of Claude Code's background traffic. Goal checks (`/goal`), summaries and title generation go to `ANTHROPIC_SMALL_FAST_MODEL`, and the goal check in particular runs on a fixed 30 s budget. Requests for the small model are therefore not rewritten to the main model: when it is a Go model with native Messages support (the default `deepseek-v4-flash` is), the bridge relays them to the gateway's own Messages endpoint untouched, headers and all. And the bridge reports input and cached token counts on `message_delta`, which is where the Anthropic SDK reads them from. Without that, every turn showed `input_tokens: 0`, so Claude Code never trimmed the transcript it hands to the goal check (and never saw the context filling up), which is how a long session ends with `Goal paused · the goal check timed out`.
+
 For Go models without either native Messages or Responses support (including GLM), Claude automatically composes the two bridges: Messages → local Responses → Chat Completions. `lulz launch claude -m glm-5.3-flash` uses this route; `--no-translate` still requires native Messages support.
 
 The same composition makes Zen's free Chat Completions models available to both harnesses. `lulz` picks the Zen or Go endpoint from the chosen model (`opencode/<id>` vs `opencode-go/<id>`). `OPENCODE_ZEN_API_KEY` is preferred when set, else the existing OpenCode credential is reused.

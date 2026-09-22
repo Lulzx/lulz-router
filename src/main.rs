@@ -523,11 +523,27 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
                 } else {
                     GO_V1.to_string()
                 };
+                // Claude Code sends its background prompts (goal checks,
+                // summaries, title generation) to ANTHROPIC_SMALL_FAST_MODEL.
+                // Rewriting those to the bridged main model made a 30 s goal
+                // check run on the slowest model in the launch; a Go model
+                // with native Messages support is relayed to the gateway
+                // untouched instead, exactly as an unbridged launch would.
+                let native = (!go_key.is_empty()
+                    && small != model
+                    && !is_zen(&small)
+                    && can_run("claude", &small))
+                .then(|| proxy::NativeMessages {
+                    base: GO_V1.to_string(),
+                    key: go_key.clone(),
+                    models: vec![small.clone()],
+                });
                 let port = proxy::spawn_anthropic(proxy::ResponsesUpstream {
                     base: upstream,
                     key: key.clone(),
                     model: model.clone(),
                     session: proxy::session_id(),
+                    native,
                 })
                 .map_err(|e| format!("could not start the translator: {e}"))?;
                 format!("http://127.0.0.1:{port}")
