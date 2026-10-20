@@ -11,6 +11,9 @@ codex exec  muse-spark-1.3-contributor  with a recursive MCP tool schema
                                                        (native, guarded) → LULZ OK
 claude -p   mimo-v2.6-flash                      (Messages → Responses → Chat) → LULZ OK
 codex exec  mimo-v2.6-flash                                        (bridged) → tool call → answer
+claude -p   minimax-m3.1-flash-free  longcat-2.5-preview-free   (via Go) → Read tool → answer
+claude -p   beam-free                     (Messages → Responses → Chat) → Read tool → answer
+codex exec  minimax-m3.1-flash-free  beam-free                   (via Go) → tool call → answer
 ```
 
 Every bridged run is a full agent turn: Codex called `exec_command`, ran `cat marker.txt`, fed the output back, and answered from it. `glm-5.3` is the one worth noting — blocked in *both* harnesses before the bridge.

@@ -5,7 +5,10 @@ The gateway doesn't serve every model over every protocol — and some accept pl
 | model | claude | codex | note |
 |---|:--:|:--:|---|
 | qwen3.5/3.6/3.7/3.8, minimax-m2.5/m2.7/m3, kimi-k3 | native | bridged | Messages+tools ok; no `/responses` |
-| deepseek-v4-flash/pro | native | native | both |
+| deepseek-v4-flash/pro, deepseek-v4.1-flash, qwen3.8-flash, minimax-m3.1-flash-free | native | native | both |
+| claude-haiku-5-5 | native | bridged | |
+| gpt-6-luna, grok-4.7, step-5-preview, longcat-2.5-preview-free | bridged | native | Claude uses the Responses bridge |
+| beam-free | bridged | bridged | Go's own `/responses` drops tool-call turns, so both go through lulz's Chat bridge |
 | muse-spark-1.2/1.3 | bridged | native | Responses-only on the current gateway |
 | gpt-5.6-luna | bridged | native | Claude uses the Responses bridge |
 | grok-4.5 | bridged | native | Claude uses the Responses bridge |

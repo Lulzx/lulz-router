@@ -26,7 +26,7 @@ const ZEN_V1: &str = "https://opencode.ai/zen/v1";
 
 const DEFAULT_CLAUDE_MODEL: &str = "muse-spark-1.3-contributor";
 const DEFAULT_CODEX_MODEL: &str = "muse-spark-1.3-contributor";
-const DEFAULT_SMALL_MODEL: &str = "deepseek-v4-flash";
+const DEFAULT_SMALL_MODEL: &str = "deepseek-v4.1-flash";
 
 /// What each model can actually drive, probed against the live gateway
 /// (`lulz doctor` re-probes and caches the result over this baseline).
@@ -52,9 +52,15 @@ const fn m(id: &'static str, ctx: u32, claude: bool, codex: bool) -> Caps {
 }
 
 const MODELS: &[Caps] = &[
+    // Go also serves a few `-free` ids; they're listed here so they keep the
+    // Go route (and the probed caps) when no Zen key is around.
+    m("beam-free", 1048576, false, false),
+    m("claude-haiku-5-5", 1000000, true, false),
     m("deepseek-v4-flash", 1000000, true, true),
+    m("deepseek-v4.1-flash", 1000000, true, true),
     m("deepseek-v4-flash-vision-exp", 1000000, true, true),
     m("deepseek-v4-pro", 1000000, true, true),
+    m("gemini-4-argon-contributor", 1048576, false, false),
     m("glm-5", 202752, false, false),
     m("glm-5.1", 202752, false, false),
     m("glm-5.2", 1000000, false, false),
@@ -67,7 +73,9 @@ const MODELS: &[Caps] = &[
     // Anthropic shape 500s the same way; /responses works, so codex-only.
     m("gpt-5.6-luna", 1050000, false, true),
     m("grok-4.5", 500000, false, true),
+    m("gpt-6-luna", 1050000, false, true),
     m("grok-4.6", 500000, false, true),
+    m("grok-4.7", 500000, false, true),
     m("hy3", 256000, false, false),
     m("hy3-preview", 256000, false, false),
     m("hy4-preview", 256000, false, false),
@@ -76,6 +84,7 @@ const MODELS: &[Caps] = &[
     m("kimi-k2.7-code", 262144, false, false),
     m("kimi-k3", 1048576, true, false),
     m("longcat-2.0", 262144, false, false),
+    m("longcat-2.5-preview-free", 1000000, false, true),
     m("mimo-v2-omni", 262144, false, false),
     m("mimo-v2-pro", 1048576, false, false),
     m("mimo-v2.5", 1000000, false, false),
@@ -89,6 +98,7 @@ const MODELS: &[Caps] = &[
     m("minimax-m2.5", 204800, true, false),
     m("minimax-m2.7", 204800, true, false),
     m("minimax-m3", 1000000, true, false),
+    m("minimax-m3.1-flash-free", 1000000, true, true),
     m("muse-spark-1.2-contributor", 1048576, false, true),
     // Muse is exposed by OpenCode Go through OpenAI Responses only. The
     // Claude harness reaches it through lulz's Messages <-> Responses bridge.
@@ -99,7 +109,9 @@ const MODELS: &[Caps] = &[
     m("qwen3.6-plus", 1000000, true, false),
     m("qwen3.7-max", 1000000, true, false),
     m("qwen3.7-plus", 1000000, true, false),
+    m("qwen3.8-flash", 1000000, true, true),
     m("qwen3.8-max", 1000000, true, false),
+    m("step-5-preview", 1000000, false, true),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -114,6 +126,11 @@ struct ZenFree {
     wire: ZenWire,
 }
 
+/// Zen free models lulz knows something about. Discovery doesn't depend on
+/// this list — any live Zen id ending in `-free` shows up — it only carries
+/// what `/models` won't say: the wire (Chat unless listed otherwise) and the
+/// context window (per models.dev). `big-pickle` is free without the suffix,
+/// so it has to be named here to be offered at all.
 const ZEN_FREE: &[ZenFree] = &[
     ZenFree {
         id: "big-pickle",
@@ -132,17 +149,47 @@ const ZEN_FREE: &[ZenFree] = &[
     },
     ZenFree {
         id: "ling-3.0-flash-fin-free",
-        ctx: 200000,
+        ctx: 262144,
         wire: ZenWire::Chat,
     },
     ZenFree {
         id: "nemotron-3-ultra-free",
-        ctx: 200000,
+        ctx: 1000000,
         wire: ZenWire::Chat,
     },
     ZenFree {
         id: "nemotron-3.5-lightning-free",
+        ctx: 262144,
+        wire: ZenWire::Chat,
+    },
+    ZenFree {
+        id: "nemotron-3.5-super-vl-free",
+        ctx: 1048576,
+        wire: ZenWire::Chat,
+    },
+    ZenFree {
+        id: "beam-free",
+        ctx: 1048576,
+        wire: ZenWire::Chat,
+    },
+    ZenFree {
+        id: "longcat-2.5-preview-free",
+        ctx: 1000000,
+        wire: ZenWire::Chat,
+    },
+    ZenFree {
+        id: "deepseek-v4.1-flash-free",
         ctx: 200000,
+        wire: ZenWire::Chat,
+    },
+    ZenFree {
+        id: "glm-5.3-flash-free",
+        ctx: 200000,
+        wire: ZenWire::Chat,
+    },
+    ZenFree {
+        id: "minimax-m3.1-flash-free",
+        ctx: 1000000,
         wire: ZenWire::Chat,
     },
     ZenFree {
@@ -406,12 +453,13 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
 
     // What the gateway actually serves, so a model it has never heard of is a
     // sentence from lulz rather than an opaque API error from the harness.
-    let zen_served = zen_free_roster();
-    let served = if go_key.is_empty() {
-        zen_served.clone()
+    let go_served = if go_key.is_empty() {
+        Vec::new()
     } else {
-        merge_served(zen_served.clone(), roster(&go_key, interactive_pick))
+        roster(&go_key, interactive_pick)
     };
+    let zen_served = zen_route(zen_free_roster(), &go_served, zen_found.is_some());
+    let served = merge_served(zen_served.clone(), go_served);
     let is_zen = |model: &str| zen_served.iter().any(|id| id == model);
     let pick = |dflt: &str| -> Result<String, String> {
         // Per-harness default wins, then the global `lulz --default`
@@ -427,7 +475,7 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
             if served.is_empty() {
                 return Err(format!("could not read the model list from {GO_V1}/models"));
             }
-            select_model(&served, &configured)?
+            select_model(&served, &zen_served, &configured)?
         } else {
             configured
         };
@@ -438,7 +486,7 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
         // with no Go key at all.
         if is_zen(&model) && zen_found.is_none() {
             return Err(format!(
-                "`{model}` is an OpenCode Zen free model but no Zen key was found.\n  run `opencode auth login`, or set OPENCODE_ZEN_API_KEY,\n  or use a Go model instead (see `lulz models`)"
+                "`{model}` is an OpenCode Zen free model but no Zen key was found.\n  create an API key at https://opencode.ai/auth and set OPENCODE_ZEN_API_KEY\n  (an OpenCode v2 login alone is refused by the Zen free tier),\n  or use a Go model instead (see `lulz models`)"
             ));
         }
         if !is_zen(&model) && go_key.is_empty() {
@@ -499,13 +547,16 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
             } else if !zen && (opts.native || !translate) {
                 gate(&model)?;
             }
-            let small = ensure_served(
-                opts.small
-                    .clone()
-                    .map(|s| resolve_alias(&s))
-                    .unwrap_or_else(|| DEFAULT_SMALL_MODEL.to_string()),
-                &served,
-            )?;
+            // An explicit --small must exist; the compiled-in default may
+            // have been retired since this build, and a launch shouldn't die
+            // over a background model — the main model covers for it.
+            let small = match opts.small.clone() {
+                Some(s) => ensure_served(resolve_alias(&s), &served)?,
+                None if served.is_empty() || served.iter().any(|id| id == DEFAULT_SMALL_MODEL) => {
+                    DEFAULT_SMALL_MODEL.to_string()
+                }
+                None => model.clone(),
+            };
             // The gateway's Messages endpoint authenticates on `x-api-key`
             // only; ANTHROPIC_AUTH_TOKEN would send `Authorization: Bearer`
             // and come back 401.
@@ -716,7 +767,7 @@ fn cmd_launch(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
-    banner(&harness, &model, provider, translate);
+    banner(&harness, &model, provider, is_zen(&model), translate);
 
     let mut cmd = Command::new(&path);
     cmd.args(&argv);
@@ -778,7 +829,7 @@ fn picker_settings(model: &str, small: &str) -> serde_json::Value {
     serde_json::json!({"modelPicker": {"options": options}})
 }
 
-fn banner(harness: &str, model: &str, provider: &str, translate: bool) {
+fn banner(harness: &str, model: &str, provider: &str, zen: bool, translate: bool) {
     if !std::io::stdout().is_terminal() {
         return;
     }
@@ -795,7 +846,7 @@ fn banner(harness: &str, model: &str, provider: &str, translate: bool) {
     eprintln!("  {}     {model}", paint("model", "2"));
     if translate {
         let direction = if harness == "claude" {
-            if claude_needs_chat_bridge(zen_wire(model).is_some(), model) {
+            if claude_needs_chat_bridge(zen, model) {
                 "messages <-> responses <-> chat completions"
             } else {
                 "messages <-> responses"
@@ -817,13 +868,15 @@ fn cmd_models(args: &[String]) -> Result<(), String> {
     let key_res = find_key();
     let key_err = key_res.as_ref().err().cloned();
     let key = key_res.map(|key| key.value).unwrap_or_default();
-    let free = zen_free_roster();
     // The default prints first so the eye lands on the common choice.
     let go = pin_defaults(if key.is_empty() {
         Vec::new()
     } else {
         roster(&key, force)
     });
+    let free = zen_route(zen_free_roster(), &go, find_zen_key().is_some());
+    // A free id served by both lists once, under the route launch would take.
+    let go: Vec<String> = go.into_iter().filter(|id| !free.contains(id)).collect();
     if free.is_empty() && go.is_empty() {
         return Err(key_err
             .unwrap_or_else(|| format!("could not read the model list from {GO_V1}/models")));
@@ -1060,7 +1113,7 @@ impl Frame {
     }
 }
 
-fn picker_lines(matches: &[&String], query: &str, selected: usize) -> Vec<String> {
+fn picker_lines(matches: &[&String], zen: &[String], query: &str, selected: usize) -> Vec<String> {
     let mut lines = vec![
         format!("  {} {}", paint("model", "1"), paint("(live)", "2")),
         format!("  {} {}_", paint("filter:", "2"), query),
@@ -1076,7 +1129,7 @@ fn picker_lines(matches: &[&String], query: &str, selected: usize) -> Vec<String
             } else {
                 " ".into()
             };
-            let shown = if zen_wire(id).is_some() {
+            let shown = if zen.contains(id) {
                 format!("{id}  [Zen]")
             } else {
                 format!("{id}  [Go]")
@@ -1100,7 +1153,7 @@ fn picker_lines(matches: &[&String], query: &str, selected: usize) -> Vec<String
     lines
 }
 
-fn select_model(ids: &[String], preferred: &str) -> Result<String, String> {
+fn select_model(ids: &[String], zen: &[String], preferred: &str) -> Result<String, String> {
     let _raw = RawTerminal::enter()?;
     let mut tty = fs::OpenOptions::new()
         .read(true)
@@ -1117,7 +1170,7 @@ fn select_model(ids: &[String], preferred: &str) -> Result<String, String> {
 
     loop {
         selected = selected.min(matches.len().saturating_sub(1));
-        frame.draw(&mut tty, &picker_lines(&matches, &query, selected))?;
+        frame.draw(&mut tty, &picker_lines(&matches, zen, &query, selected))?;
 
         let mut byte = [0u8; 1];
         tty.read_exact(&mut byte)
@@ -1247,25 +1300,42 @@ fn select_harness() -> Result<String, String> {
 
 // ---------------------------------------------------------------- roster ---
 
+fn zen_entry(model: &str) -> Option<&'static ZenFree> {
+    ZEN_FREE.iter().find(|entry| entry.id == model)
+}
+
+/// Free on Zen: listed above, or carrying the `-free` suffix Zen gives every
+/// zero-cost id. Go-table ids are excluded so a Go model that happens to end
+/// in `-free` (ox-alpha-free) keeps its Go route.
+fn is_zen_free(model: &str) -> bool {
+    zen_entry(model).is_some() || (model.ends_with("-free") && caps(model).is_none())
+}
+
 fn zen_wire(model: &str) -> Option<ZenWire> {
-    ZEN_FREE
-        .iter()
-        .find(|entry| entry.id == model)
-        .map(|entry| entry.wire)
+    if let Some(entry) = zen_entry(model) {
+        return Some(entry.wire);
+    }
+    if !is_zen_free(model) {
+        return None;
+    }
+    // Zen serves muse over Responses only; everything else speaks Chat.
+    Some(if model.starts_with("muse-") {
+        ZenWire::Responses
+    } else {
+        ZenWire::Chat
+    })
 }
 
 fn model_context(model: &str) -> Option<u32> {
-    ZEN_FREE
-        .iter()
-        .find(|entry| entry.id == model)
+    zen_entry(model)
         .map(|entry| entry.ctx)
         .or_else(|| context_window(model))
 }
 
-/// The Zen API does not publish pricing in `/models`, so the official free
-/// lineup is an allowlist intersected with the live roster. Paid Zen IDs can
-/// therefore never leak into the picker, while retired free IDs disappear as
-/// soon as Zen stops advertising them.
+/// The Zen API does not publish pricing in `/models`, so "free" is the
+/// `-free` suffix (plus the named exceptions in `ZEN_FREE`). Paid Zen IDs can
+/// therefore never leak into the picker, new free IDs appear as soon as Zen
+/// advertises them, and retired ones disappear just as fast.
 fn zen_free_roster() -> Vec<String> {
     let live = Command::new("curl")
         .args(["-sS", "--max-time", "20", &format!("{ZEN_V1}/models")])
@@ -1277,12 +1347,32 @@ fn zen_free_roster() -> Vec<String> {
     filter_zen_free(&live)
 }
 
+/// Known free models first, in table order, then any newcomers in the order
+/// Zen lists them.
 fn filter_zen_free(live: &[String]) -> Vec<String> {
-    ZEN_FREE
+    let mut out: Vec<String> = ZEN_FREE
         .iter()
         .filter(|entry| live.iter().any(|id| id == entry.id))
         .map(|entry| entry.id.to_string())
-        .collect()
+        .collect();
+    for id in live {
+        if is_zen_free(id) && !out.contains(id) {
+            out.push(id.clone());
+        }
+    }
+    out
+}
+
+/// Which free ids take the Zen route. The Zen free tier refuses anything but a
+/// Zen API key (an OpenCode v2 login token included), so without one a free
+/// id Go also serves — minimax-m3.1-flash-free, beam-free — goes through Go,
+/// the route that will actually answer. Zen-only ids stay listed either way;
+/// picking one without a key stops with a sentence saying what to set.
+fn zen_route(zen: Vec<String>, go: &[String], zen_key: bool) -> Vec<String> {
+    if zen_key {
+        return zen;
+    }
+    zen.into_iter().filter(|id| !go.contains(id)).collect()
 }
 
 /// Zen rows first, then Go; an id served by both keeps its Zen row only, so
@@ -1415,6 +1505,11 @@ fn cache_path() -> PathBuf {
 /// `harness:model` -> "ok" | "no", as last measured by `lulz doctor`.
 fn probe_cache() -> BTreeMap<String, String> {
     let mut m = BTreeMap::new();
+    // Tests pin the baseline table; whatever `lulz doctor` last measured on
+    // this machine must not leak into them.
+    if cfg!(test) {
+        return m;
+    }
     if let Ok(s) = fs::read_to_string(cache_path()) {
         for line in s.lines() {
             if let Some((k, v)) = line.trim().split_once('=') {
@@ -1508,6 +1603,10 @@ fn record(out: &mut String, harness: &str, id: &str, v: &Verdict) {
 /// Ask the gateway what it will actually accept, rather than trusting the
 /// baseline table. Tools are the point: a model that 400s on a tool schema is
 /// useless to a coding harness even though plain chat works.
+/// Go answers a request without a session id with 400 `MissingSessionID`,
+/// which would otherwise be cached as "this model can't do tools".
+const DOCTOR_SESSION: &str = "x-opencode-session: lulz-doctor";
+
 fn cmd_doctor() -> Result<(), String> {
     let key = find_key()?.value;
     let ids = roster(&key, true);
@@ -1529,12 +1628,14 @@ fn cmd_doctor() -> Result<(), String> {
                 &format!("x-api-key: {key}"),
                 "-H",
                 "anthropic-version: 2023-06-01",
+                "-H",
+                DOCTOR_SESSION,
             ],
             &TOOL_PROBE.replace("%M", id),
         );
         let codex = probe(
             &format!("{GO_V1}/responses"),
-            &["-H", &format!("Authorization: Bearer {key}")],
+            &["-H", &format!("Authorization: Bearer {key}"), "-H", DOCTOR_SESSION],
             &format!(r#"{{"model":"{id}","input":"hi","max_output_tokens":16}}"#),
         );
         claude_answered |= matches!(claude, Verdict::Ok);
@@ -1659,7 +1760,37 @@ fn find_key() -> Result<Key, String> {
             });
         }
     }
+    if let Some(v) = opencode_db_token() {
+        return Ok(Key {
+            value: v,
+            source: "opencode.db (OpenCode v2 login)".into(),
+        });
+    }
     Err("no OpenCode Go key found.\n  run `opencode auth login`, or set OPENCODE_API_KEY,\n  then `lulz auth --save` to stash it in the Keychain".into())
+}
+
+/// OpenCode v2 dropped auth.json: `opencode auth login` now stores an OAuth
+/// credential in its SQLite db. The access token works as a Go bearer (the
+/// Zen free tier still refuses it). Read through the `sqlite3` CLI, the same
+/// way the roster goes through `curl`, so lulz stays dependency-free.
+fn opencode_db_token() -> Option<String> {
+    let db = home().join(".local/share/opencode/opencode.db");
+    if !db.exists() {
+        return None;
+    }
+    let out = Command::new("sqlite3")
+        .args([
+            "-readonly",
+            &db.to_string_lossy(),
+            "select coalesce(json_extract(value,'$.access'),json_extract(value,'$.key')) \
+             from credential where integration_id='opencode' and active=1 \
+             order by time_updated desc limit 1",
+        ])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !v.is_empty()).then_some(v)
 }
 
 fn find_zen_key() -> Option<Key> {
@@ -2094,24 +2225,40 @@ mod tests {
     fn zen_list_is_free_only_and_keeps_free_models_first() {
         let live = ids(&[
             "claude-opus-5",
+            "brand-new-free",
             "muse-spark-1.3-contributor-free",
             "big-pickle",
             "deepseek-v4-flash-free",
             "mimo-v2.5-free",
+            "ox-alpha-free",
         ]);
         assert_eq!(
             filter_zen_free(&live),
             ids(&[
                 "big-pickle",
                 "mimo-v2.5-free",
-                "muse-spark-1.3-contributor-free"
+                "muse-spark-1.3-contributor-free",
+                "brand-new-free",
+                "deepseek-v4-flash-free",
             ])
         );
         assert_eq!(zen_wire("big-pickle"), Some(ZenWire::Chat));
+        assert_eq!(zen_wire("brand-new-free"), Some(ZenWire::Chat));
+        assert_eq!(zen_wire("muse-spark-9-free"), Some(ZenWire::Responses));
         assert_eq!(
             zen_wire("muse-spark-1.3-contributor-free"),
             Some(ZenWire::Responses)
         );
+        assert_eq!(zen_wire("ox-alpha-free"), None);
+        assert_eq!(zen_wire("claude-opus-5"), None);
+    }
+
+    #[test]
+    fn free_ids_go_also_serves_route_through_go_without_a_zen_key() {
+        let zen = ids(&["big-pickle", "minimax-m3.1-flash-free", "beam-free"]);
+        let go = ids(&["minimax-m3.1-flash-free", "beam-free", "kimi-k3"]);
+        assert_eq!(zen_route(zen.clone(), &go, false), ids(&["big-pickle"]));
+        assert_eq!(zen_route(zen.clone(), &go, true), zen);
     }
 
     #[test]
@@ -2246,20 +2393,20 @@ mod tests {
         assert_eq!(matches.len(), 25);
 
         // Ten rows, one blank line above and below, header and footer.
-        let lines = picker_lines(&matches, "", 0);
+        let lines = picker_lines(&matches, &[], "", 0);
         assert_eq!(lines.len(), 15);
         assert!(lines[3].starts_with("  > model-00"));
         assert!(lines[12].starts_with("    model-09"));
 
         // Past the tenth row the window slides, keeping the selection in view.
-        let lines = picker_lines(&matches, "", 20);
+        let lines = picker_lines(&matches, &[], "", 20);
         assert_eq!(lines.len(), 15);
         assert!(lines[3].starts_with("    model-11"));
         assert!(lines[12].starts_with("  > model-20"));
 
         // A query with no matches still gets a frame of its own.
         let none = filtered_models(&all, "zzz");
-        let lines = picker_lines(&none, "zzz", 0);
+        let lines = picker_lines(&none, &[], "zzz", 0);
         assert_eq!(lines.len(), 6);
         assert!(lines[3].contains("no matching models"));
     }
@@ -2294,7 +2441,7 @@ mod tests {
             assert_eq!(harness_lines(selected).len(), HARNESSES.len() + 4);
         }
         let all = ids(&["a", "b"]);
-        assert_eq!(picker_lines(&filtered_models(&all, ""), "", 0).len(), 7);
+        assert_eq!(picker_lines(&filtered_models(&all, ""), &[], "", 0).len(), 7);
     }
 
     #[test]
